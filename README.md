@@ -1,4 +1,4 @@
-# <img src="assets/images/tesco-logo.png" alt="" height="30" valign="middle"> Tesco Data Engineering Project
+# <img src="assets/images/tesco-logo.png" alt="" height="30" valign="middle"> Data Engineering Project
 
 A hands-on, end-to-end data engineering project built on a synthetic UK retail
 dataset. You start with plain CSV files, land them in Postgres, push them to a
