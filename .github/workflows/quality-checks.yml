@@ -1,0 +1,41 @@
+name: Quality checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run pre-commit hooks on all files
+        uses: pre-commit/action@v3.0.1
+        # This runs the exact hooks defined in .pre-commit-config.yaml.
+        # It runs on GitHub's infrastructure, so it applies no matter what
+        # any individual contributor has (or hasn't) set up locally.
+
+  large-file-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Block large binaries outside git-lfs
+        run: |
+          git diff --name-only origin/main...HEAD | while read -r f; do
+            if [ -f "$f" ]; then
+              size=$(stat -c%s "$f")
+              if [ "$size" -gt 5000000 ]; then
+                echo "::error file=$f::File exceeds 5MB - use git-lfs or DVC for mlflow artefacts instead of committing directly."
+                exit 1
+              fi
+            fi
+          done

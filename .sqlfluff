@@ -1,0 +1,12 @@
+[sqlfluff]
+# Change to your actual warehouse dialect, e.g. databricks, snowflake, postgres, tsql
+dialect = databricks
+templater = jinja
+max_line_length = 120
+
+[sqlfluff:indentation]
+indented_joins = false
+indented_using_on = true
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = upper

@@ -1,0 +1,52 @@
+# See https://pre-commit.com for full documentation.
+# Local setup (for fast feedback): uv add pre-commit && pre-commit install
+# Real enforcement happens via .github/workflows/quality-checks.yml + branch protection, not via this file alone.
+
+repos:
+  # --- Python: lint + format ---
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # --- Jupyter notebooks: lint the code cells with the same ruff rules ---
+  - repo: https://github.com/nbQA-dev/nbQA
+    rev: 1.8.7
+    hooks:
+      - id: nbqa-ruff
+        args: [--fix]
+
+  # --- Jupyter notebooks: strip output/execution metadata before commit ---
+  # Keeps diffs readable, stops large images/dataframes/outputs bloating history,
+  # and stops accidental leakage of data or credentials printed in cell output.
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.7.1
+    hooks:
+      - id: nbstripout
+
+  # --- SQL: lint + format ---
+  - repo: https://github.com/sqlfluff/sqlfluff
+    rev: 3.1.0
+    hooks:
+      - id: sqlfluff-lint
+      - id: sqlfluff-fix
+
+  # --- General hygiene ---
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: [--maxkb=5000] # blocks accidental commits of model binaries/artefacts
+
+  # --- Secret scanning ---
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
