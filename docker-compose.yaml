@@ -14,7 +14,7 @@ services:
 
     volumes:
       - ${POSTGRES_DATA_PATH}:/var/lib/postgresql/data
-      - ${DATASETS_PATH}:/data
+      - ${DATA_PATH}:/data
 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]

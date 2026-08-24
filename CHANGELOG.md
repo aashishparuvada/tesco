@@ -5,6 +5,111 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-24
+
+Takes the pipeline off the laptop. Adds a hosted-Postgres target so the data
+sits somewhere a cloud warehouse can reach, and documents the project as a
+follow-along data engineering tutorial.
+
+### Added
+
+#### Hosted Postgres ingestion
+
+- `scripts/python/load_supabase.py` — loads every CSV in `data/` into the
+  `raw_data` schema of a hosted Postgres. Behaviour is identical to the local
+  loader; only the connection differs.
+  - **Connection string** — read from `SUPABASE_CONNECTION_STRING`. A literal
+    `{SUPABASE_DB_PASSWORD}` placeholder in it is substituted at runtime and
+    percent-encoded, so the password lives in one place and special characters
+    cannot break URL parsing.
+  - **TLS** — `sslmode=require` is appended when absent. psycopg2 would
+    otherwise only *prefer* TLS and could silently fall back to plaintext.
+  - **Redacted logging** — the target is printed without the password.
+  - **Actionable connection errors** — a failure prints guidance covering the
+    IPv6-only direct host, the pooler alternative, and paused free-tier
+    projects, rather than a bare DNS error.
+- `.env.example` — now documents the Supabase variables
+  (`SUPABASE_CONNECTION_STRING`, `SUPABASE_DB_PASSWORD`), the optional
+  `POSTGRES_HOST`, and is split into local and hosted sections. The pooler URI
+  is the documented default, with the direct URI commented out beneath it.
+
+#### Documentation
+
+- `README.md` — written from placeholder to a full guide: what the project
+  teaches, an architecture diagram, the dataset, which accounts to create and
+  **when**, verified walkthroughs for the local and hosted loads, the Stage 2
+  CDC design, repository layout, and a troubleshooting table.
+  - Highlights, as a callout on the Databricks connector step, that a Supabase
+    source must be registered with its **session pooler** credentials rather
+    than the direct host, including the host/port/user comparison. The direct
+    host does not connect over IPv4, so the managed connector cannot reach it.
+  - Records the counterpart caveat: a connection that tests green is not proof
+    replication will run, since Supabase documents that logical replication does
+    not pass through the pooler.
+- `assets/images/tesco-logo.png` — logo used in the README heading, stored in
+  the repository rather than hotlinked so the page does not depend on a
+  third-party CDN. Cropped to the wordmark and given a transparent background so
+  it renders correctly in both light and dark themes.
+- A note that the project is independent and not affiliated with or endorsed by
+  Tesco plc.
+- `scripts/sql/raw_data/ddl.sql` — the generated schema definition is now
+  tracked, so schema changes appear in review.
+
+### Changed
+
+- **Shared loader module.** The profiling, type-inference, DDL-generation and
+  `COPY` logic moved out of `load_data.py` into `scripts/python/loader.py`.
+  `load_data.py` and `load_supabase.py` are now thin entry points that differ
+  only in how they connect, so the two targets cannot drift apart.
+- **Schema creation is conditional.** `CREATE SCHEMA` is no longer issued
+  unconditionally: `information_schema.schemata` is checked first and the schema
+  created only when genuinely missing. Issuing it unconditionally would require
+  privileges the connecting role may not hold on a hosted database. The
+  generated `ddl.sql` still carries `CREATE SCHEMA IF NOT EXISTS` so the file
+  remains runnable on its own.
+- Both loaders now set a 10-second connection timeout, so an unreachable host
+  fails promptly instead of hanging.
+- `pyproject.toml` — the package is renamed from `walmart` to `tesco` and its
+  version tracks the release, having sat at `0.1.0` since the scaffold was
+  created.
+
+### Fixed
+
+- `docker-compose.yaml` mounted `${DATASETS_PATH}`, a variable no `.env` defined
+  or documented, leaving the container's `/data` mount pointing nowhere. It now
+  uses `${DATA_PATH}`, matching `.env.example`.
+
+### Notes
+
+- **Both loads are now verified end-to-end**, superseding the note in 1.1.0:
+  42,796 rows into local Postgres 16 and into hosted Postgres 17.6, with row
+  counts, inferred types, primary keys and cross-table referential integrity
+  checked on the target rather than trusted from the script's own output.
+- **Hosted Supabase requires the connection pooler.** The direct host
+  `db.<project-ref>.supabase.co` resolves to an IPv6 address only, so it is
+  unreachable from an IPv4-only network. The session pooler
+  (`aws-<n>-<region>.pooler.supabase.com`, port 5432, username
+  `postgres.<project-ref>`) is IPv4-compatible. Both the `aws-<n>-` prefix and
+  the region are per-project and cannot be guessed. Session mode is preferred
+  over transaction mode because the loader copies inside one transaction.
+- **Two blockers stand between this release and log-based CDC**, both documented
+  vendor limits and both recorded in the README:
+  - Lakeflow Connect's ingestion gateway runs on classic compute, while
+    Databricks Free Edition is serverless-only — so the managed PostgreSQL
+    connector needs a paid or trial workspace.
+  - Logical replication cannot pass through Supabase's pooler and the direct
+    host is IPv6-only, so CDC from a free Supabase project is not reachable;
+    it needs the IPv4 add-on (Pro plan) or a different host such as Neon.
+
+  The README therefore documents a second path — Lakehouse Federation plus
+  `AUTO CDC` sequenced on `updated_timestamp` — that runs on free tiers.
+- The Stage 2 SQL in the README is adapted from vendor documentation and is
+  **not** yet executed by anything in this repository. The Lakeflow Connect
+  PostgreSQL connector is in Public Preview and its details may change.
+- Credentials belong only in `.env`, which stays git-ignored; `.env.example`
+  carries placeholders. Rotate anything that reaches a remote rather than
+  rewriting history.
+
 ## [1.1.0] - 2026-08-24
 
 Makes the dataset loadable. Adds an ingestion script that derives the `raw_data`
@@ -171,5 +276,6 @@ The dataset was generated on par to a UK/Tesco context:
   `product_id`, `order_id`, `order_item_id`) are surrogate integers starting at
   1 and are stable — downstream scripts can rely on them.
 
+[1.2.0]: https://github.com/aashishparuvada/tesco/
 [1.1.0]: https://github.com/aashishparuvada/tesco/
 [1.0.0]: https://github.com/aashishparuvada/tesco/
