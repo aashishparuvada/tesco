@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-25
+
+Begins the transformation layer. Adds dbt with the Databricks adapter and
+documents the setup end to end — the version pin the adapter forces, the project
+layout `dbt init` leaves behind, where the credentials live, the macOS
+certificate problem that stands between a fresh machine and a passing
+`dbt debug`, and the VS Code tooling on top.
+
+### Added
+
+- **dbt** — `dbt-core<1.12` and `dbt-databricks>=1.12.4` added to
+  `pyproject.toml`; scaffolded dbt project in `dbt/`, targeting a Databricks SQL
+  warehouse.
+- `dbt/profiles.yml.example` — committed template. The real `dbt/profiles.yml`
+  carries a personal access token and is now git-ignored, as is `dbt/.user.yml`
+  (a machine-local anonymous id). Every host, HTTP path, and token in the docs is
+  a placeholder — this repo is public.
+- `README.md` — new **Setting up dbt for Databricks** section, written as the
+  setup that was actually performed:
+  - **Why `dbt-core` is pinned below 1.12.** `dbt-databricks` 1.12.4 requires
+    `dbt-core>=1.11.2,<1.12.1`, so an unconstrained `uv add` picks a version the
+    adapter rejects. Also records that the resulting *"dbt-core is out of date"*
+    banner is expected and must not be acted on.
+  - **Scaffolding.** `dbt init` cannot initialise into an existing directory, so
+    it produced `dbt/tesco/`; the contents were moved up into `dbt/` and the
+    empty `tesco/` removed, making the dbt project `dbt/` itself.
+  - **Where `profiles.yml` lives** — moved out of `~/.dbt/` to sit beside the
+    project, and why every dbt command runs from `dbt/`.
+  - **The `CERTIFICATE_VERIFY_FAILED` error**, with the real root cause: a
+    python.org framework Python ships no CA bundle until
+    `Install Certificates.command` runs, so `.../etc/openssl/cert.pem` does not
+    exist and OpenSSL reports the missing trust anchor as *"self-signed
+    certificate in certificate chain"*. Documents the two commands that confirm
+    it, the single command that fixes it machine-wide, and why patching
+    `SSL_CERT_FILE` in a shell profile is the wrong answer — VS Code's extension
+    host never sees it, and pointing it into a project `.venv` breaks every other
+    project when that venv is rebuilt.
+  - **VS Code**, where the dbt Power User extension runs dbt from the interpreter
+    the Python extension selected — which in this layout is the venv at the repo
+    root, one level above the dbt project — plus why `dbt.dbtIntegration` and the
+    profiles directory need no configuration here.
+  - **The 15-minute hang.** `databricks-sql-connector` retries the failed TLS
+    handshake up to its 900-second policy before surfacing the error, so
+    `dbt debug` looks stuck on *"Opening a new connection"*.
+- `.vscode/settings.json` and `.vscode/extensions.json` — committed workspace
+  config: pins the interpreter to `.venv/bin/python` so dbt Power User resolves
+  dbt, scopes `jinja-sql` highlighting to `dbt/` so the generated `ddl.sql` stays
+  plain SQL, and recommends the extension to anyone opening the repo.
+- `README.md` — eight new Troubleshooting rows for the above.
+
 ## [1.2.0] - 2026-08-24
 
 Takes the pipeline off the laptop. Adds a hosted-Postgres target so the data
@@ -276,6 +326,7 @@ The dataset was generated on par to a UK/Tesco context:
   `product_id`, `order_id`, `order_item_id`) are surrogate integers starting at
   1 and are stable — downstream scripts can rely on them.
 
+[1.3.0]: https://github.com/aashishparuvada/tesco/
 [1.2.0]: https://github.com/aashishparuvada/tesco/
 [1.1.0]: https://github.com/aashishparuvada/tesco/
 [1.0.0]: https://github.com/aashishparuvada/tesco/

@@ -1,0 +1,9 @@
+target/
+dbt_packages/
+logs/
+
+# Machine-local: dbt's anonymous-usage id
+.user.yml
+
+# Real credentials - the committed template is profiles.yml.example
+profiles.yml

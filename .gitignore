@@ -14,3 +14,4 @@ wheels/
 
 # Secrets
 .env
+profiles.yml

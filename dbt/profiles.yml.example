@@ -1,0 +1,11 @@
+tesco:
+  outputs:
+    dev:
+      catalog: tesco
+      host: <YOUR_DATABRICKS_HOST>
+      http_path: <YOUR_DATABRICKS_HTTP_PATH>
+      schema: dbt_schema
+      threads: 1
+      token: <YOUR_DATABRICKS_TOKEN>
+      type: databricks
+  target: dev

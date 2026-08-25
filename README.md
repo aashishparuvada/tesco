@@ -25,6 +25,7 @@ README says so plainly instead of letting you discover it halfway through.
 - [Stage 0 — Land the CSVs in local Postgres](#stage-0--land-the-csvs-in-local-postgres)
 - [Stage 1 — Push to a hosted Postgres](#stage-1--push-to-a-hosted-postgres)
 - [Stage 2 — CDC from Postgres into Databricks](#stage-2--cdc-from-postgres-into-databricks)
+- [Setting up dbt for Databricks](#setting-up-dbt-for-databricks)
 - [Repository layout](#repository-layout)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
@@ -503,6 +504,284 @@ SELECT count(*) FROM bronze.order_items;                   -- expect 30,021
 
 ---
 
+## Setting up dbt for Databricks
+
+The transformations on top of Stage 2 are built with
+[dbt](https://docs.getdbt.com/), running against a Databricks SQL warehouse via
+the `dbt-databricks` adapter. The dbt project lives in `dbt/`.
+
+```bash
+uv sync                  # dbt-core and dbt-databricks are already in pyproject.toml
+cd dbt
+uv run dbt debug         # must print "All checks passed!" before you write a model
+```
+
+What follows is how this project was actually set up, in order: the version pin
+the adapter forces on you, how `dbt init` was run and the layout it leaves
+behind, where the credentials live, the one macOS certificate problem that stands
+between a fresh machine and a passing `dbt debug`, and the VS Code setup on top.
+
+### 1. Pin `dbt-core` below 1.12, or resolution fails
+
+Installing the two packages without a constraint does not work:
+
+```bash
+uv add dbt-core dbt-databricks          # fails to resolve
+```
+
+`dbt-databricks` trails `dbt-core` by design. Version 1.12.4 declares:
+
+```
+Requires-Dist: dbt-core<1.12.1,>=1.11.2
+Requires-Dist: dbt-spark<1.11.0,>=1.10.0
+```
+
+Unconstrained, the resolver reaches for the newest `dbt-core` on PyPI — 1.12.3
+at the time of writing — which is outside that range. The working install is:
+
+```bash
+uv add "dbt-core<1.12" dbt-databricks
+```
+
+which is what `pyproject.toml` records. It resolves to `dbt-core` 1.11.14,
+`dbt-databricks` 1.12.4, `dbt-spark` 1.10.3.
+
+> [!IMPORTANT]
+> **`dbt --version` will tell you dbt-core is out of date. Ignore it.**
+>
+> ```
+> Core:
+>   - installed: 1.11.14
+>   - latest:    1.12.3  - Update available!
+> ```
+>
+> That warning compares against PyPI, not against what your adapter supports.
+> Upgrading `dbt-core` to satisfy it breaks the adapter. Do not pin *downwards*
+> either — `dbt-core<=1.7` also fails to resolve, because 1.11.2 is the floor
+> `dbt-databricks` 1.12.4 accepts. The usable window is narrow: `>=1.11.2,<1.12.1`.
+
+### 2. Scaffold the project, then flatten it
+
+`dbt init` will not initialise a project *inside* an existing directory — it
+always creates a new subdirectory named after the project. Run from `dbt/`, it
+gives you `dbt/tesco/`, one level deeper than you want:
+
+```
+dbt/
+└── tesco/               # <- the extra level
+    ├── dbt_project.yml
+    ├── models/
+    └── ...
+```
+
+The prompts it asks are: which adapter (`databricks`), then the workspace host,
+the SQL warehouse HTTP path, a personal access token, `catalog` (`tesco`),
+`schema` (`dbt_schema`), and `threads` (`1`).
+
+That nested layout was then flattened by hand, so the dbt project *is* `dbt/`:
+
+```bash
+cd dbt
+uv run dbt init                 # project name: tesco  ->  creates dbt/tesco/
+mv tesco/* tesco/.[!.]* .       # the dotfiles matter - .gitignore is one of them
+rmdir tesco                     # refuses to run if anything was left behind
+```
+
+Use `rmdir`, not `rm -rf`. It fails loudly if the move missed a file, which is
+exactly what you want — `dbt init` writes `.gitignore` into the project root and
+a plain `mv tesco/* .` silently leaves it behind.
+
+The result is `dbt/dbt_project.yml`, `dbt/models/`, `dbt/macros/`, and so on,
+with no `tesco/` in the middle. `dbt_project.yml` still names both the project
+and its profile `tesco`, which is what ties it to `profiles.yml` below.
+
+### 3. Where `profiles.yml` lives
+
+`dbt init` writes your credentials to `~/.dbt/profiles.yml`, outside the repo.
+This project keeps them next to the dbt project instead, so the whole setup is
+visible in one tree:
+
+- `dbt/profiles.yml` — your real host, HTTP path, and token. **Git-ignored.**
+- `dbt/profiles.yml.example` — the same file with placeholders, committed.
+
+```bash
+cp dbt/profiles.yml.example dbt/profiles.yml   # then fill in host, http_path, token
+```
+
+dbt looks for `profiles.yml` in the current directory before falling back to
+`~/.dbt/`, which is why every dbt command in this README runs from `dbt/`. From
+anywhere else, pass `--profiles-dir dbt`.
+
+The token in that file is a live credential. `gitleaks` runs in pre-commit as a
+backstop and `dbt/.gitignore` covers both `profiles.yml` and `.user.yml`, but if
+a token ever does reach a remote, rotate it in Databricks rather than trying to
+rewrite history.
+
+### 4. The certificate error, and the one command that fixes it
+
+On macOS with a python.org (framework) Python, TLS fails twice — once while
+installing the packages, once on `dbt debug` — and the two look like unrelated
+problems. They are the same problem, and it is neither dbt's fault nor your
+network's.
+
+**Symptom 1 — installing.** A certificate error while fetching from PyPI:
+expired, unable to verify, or self-signed in chain, depending on which tool
+reports it.
+
+**Symptom 2 — `dbt debug`.** Every configuration check passes, then the
+connection test blows up:
+
+```
+Connection:
+  host: <your-workspace>.cloud.databricks.com
+  http_path: /sql/1.0/warehouses/<id>
+  catalog: tesco
+  schema: dbt_schema
+Registered adapter: databricks=1.12.4
+...
+  File ".../urllib3/util/ssl_.py", line 477, in _ssl_wrap_socket_impl
+    return ssl_context.wrap_socket(sock, server_hostname=server_hostname)
+  File ".../python3.12/ssl.py", line 1320, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1000)
+```
+
+> [!WARNING]
+> **`dbt debug` can sit there for fifteen minutes before showing you any of
+> that.** `databricks-sql-connector` treats the failed handshake as retryable and
+> works through its retry policy first:
+>
+> ```
+> Error during request to server. Retry request would exceed Retry policy
+> max retry duration of 900.0 seconds
+> Error properties: attempt=1/30, elapsed-seconds=858.7/900.0, method=OpenSession
+> ```
+>
+> If `dbt debug` hangs on *"Opening a new connection"*, do not wait it out.
+> Ctrl-C and check your certificate store.
+
+**The cause.** The python.org installer ships **no CA bundle at all** until you
+run its post-install script. The interpreter has nothing to validate any chain
+against, and OpenSSL reports that missing trust anchor as *"self-signed
+certificate in certificate chain"* — which sends everybody hunting for a
+corporate proxy that does not exist. Two commands confirm it:
+
+```bash
+ls -l /Library/Frameworks/Python.framework/Versions/3.12/etc/openssl/
+# empty - there is no cert.pem
+
+uv run python -c "import ssl; print(ssl.get_default_verify_paths())"
+# openssl_cafile='/Library/Frameworks/.../etc/openssl/cert.pem'   <- a file that does not exist
+```
+
+A venv built from that interpreter inherits the problem, which is why `uv` and
+`dbt` fail identically. `curl` and your browser keep working, because they use
+the system keychain rather than Python's store — and that asymmetry is what
+makes it look like a dbt bug.
+
+**The fix.** Run the installer's certificate script once:
+
+```bash
+open "/Applications/Python 3.12/Install Certificates.command"
+```
+
+It pip-installs `certifi` into the framework Python and symlinks the missing
+store at it (`pip` carries its own bundled certificates, so it works even while
+the store is broken). Verify:
+
+```bash
+ls -l /Library/Frameworks/Python.framework/Versions/3.12/etc/openssl/cert.pem
+# cert.pem -> ../../lib/python3.12/site-packages/certifi/cacert.pem
+
+cd dbt && uv run dbt debug
+#   Connection test: [OK connection ok]
+# All checks passed!
+```
+
+> [!IMPORTANT]
+> **This is the whole fix. Do not set `SSL_CERT_FILE` in your shell profile.**
+>
+> One run repairs every venv, every project, and every tool on the machine —
+> including VS Code, whose extension host does not read `~/.zshrc` and so cannot
+> see a terminal-only workaround anyway. `export SSL_CERT_FILE=...` will get a
+> single command working in a pinch, but as a permanent fix it is a trap:
+> pointing it at a path inside a project's `.venv` makes every Python program on
+> your machine depend on that venv, and rebuilding `.venv` breaks them all in
+> unrelated places. Fix the interpreter instead and set nothing.
+
+### 5. VS Code: the dbt Power User extension
+
+dbt on its own is a CLI. [dbt Power
+User](https://marketplace.visualstudio.com/items?itemName=innoverio.vscode-dbt-power-user)
+(`innoverio.vscode-dbt-power-user`) makes it usable in an editor: compiled-SQL
+preview beside the model you are editing, a lineage graph built from your
+`ref()` calls, go-to-definition across models, column-level autocomplete, and
+run / test buttons per model. None of it is required — every command in this
+README is CLI-first and stays that way — but on a project with a Jinja-heavy
+model layer it saves a lot of `dbt compile && cat target/...`.
+
+Installing it pulls in three extensions it depends on, so you do not install
+them separately:
+
+| Extension | Why |
+| --- | --- |
+| `samuelcolvin.jinjahtml` | Jinja-aware SQL syntax highlighting |
+| `ms-python.python` | Supplies the interpreter the extension runs dbt with |
+| `altimateai.vscode-altimate-mcp-server` | Optional Altimate AI features; harmless if unused |
+
+**The one thing you must get right is the interpreter.** The extension does not
+bundle dbt — it shells out to whichever Python the Python extension has
+selected, so that interpreter has to be the one holding `dbt-core`. In this repo
+that is the venv at the **repo root**, one level *above* the dbt project:
+
+```
+tesco/
+├── .venv/bin/python        <- select this: it has dbt-core 1.11.14
+└── dbt/dbt_project.yml     <- the dbt project the extension discovers
+```
+
+`.vscode/settings.json` is committed and already points at it:
+
+```json
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "files.associations": { "dbt/**/*.sql": "jinja-sql" }
+}
+```
+
+The `files.associations` glob is scoped to `dbt/` on purpose — `jinja-sql` is
+right for models, but `scripts/sql/raw_data/ddl.sql` is generated plain SQL and
+stays plain SQL. `.vscode/extensions.json` recommends the extension, so a
+teammate opening the repo is prompted rather than told.
+
+Two settings you should *not* need to touch: `dbt.dbtIntegration` already
+defaults to `core`, which is correct here — this is dbt Core against a SQL
+warehouse, not dbt Cloud. And there is no profiles-directory setting to
+configure, because the extension runs dbt with the project directory as its
+working directory, and `dbt/profiles.yml` sits right next to
+`dbt/dbt_project.yml`. That is the practical reason the credentials were moved
+out of `~/.dbt/` in [step 3](#3-where-profilesyml-lives) — the CLI and the
+extension then find the same file with no configuration at all.
+
+If the extension still reports that dbt is not installed, set
+`dbt.dbtPythonPathOverride` to the **absolute** path of `.venv/bin/python`. VS
+Code does not expand `${workspaceFolder}` in arbitrary extension settings, so a
+variable will not work there:
+
+```json
+{ "dbt.dbtPythonPathOverride": "/Users/you/projects/tesco/.venv/bin/python" }
+```
+
+> [!IMPORTANT]
+> **Fix the certificate store before you trust this extension's error
+> messages.** It runs dbt itself, so a broken trust store
+> ([step 4](#4-the-certificate-error-and-the-one-command-that-fixes-it)) surfaces
+> here as a failed connection, a stalled lineage graph, or a query preview that
+> never returns — with no terminal output to explain why. Get `uv run dbt debug`
+> printing *"All checks passed!"* on the command line first, then open VS Code.
+
+---
+
 ## Repository layout
 
 ```
@@ -515,6 +794,12 @@ tesco/
 │   │   └── load_supabase.py       # Entry point -> hosted Postgres
 │   └── sql/
 │       └── raw_data/ddl.sql       # GENERATED - do not edit by hand
+├── dbt/
+│   ├── models/                    # dbt models (Databricks target)
+│   ├── dbt_project.yml
+│   ├── profiles.yml.example       # Copy to profiles.yml - GIT-IGNORED
+│   └── profiles.yml               # Your host / http_path / token - never committed
+├── .vscode/                       # Interpreter + extension recommendations
 ├── docker-compose.yaml            # Local Postgres 16
 ├── .env.example                   # Every variable, documented
 ├── .pre-commit-config.yaml        # ruff, sqlfluff, gitleaks, hygiene
@@ -525,6 +810,9 @@ tesco/
 
 `ddl.sql` is generated output. To change the schema, change the inference rules
 in `loader.py` and re-run — do not hand-edit the SQL.
+
+`dbt/profiles.yml` holds a live Databricks token and is git-ignored. Commit
+changes to `profiles.yml.example` instead.
 
 ### Development
 
@@ -553,6 +841,14 @@ spaces and no column alignment padding.
 | Databricks cannot reach your database | Free Edition restricts outbound access until the account is verified. Verify, then retry. |
 | Databricks PostgreSQL connector will not connect to Supabase | You gave it the direct host. Use the Session pooler host `aws-<n>-<region>.pooler.supabase.com` with username `postgres.<project-ref>` — see [Path A](#path-a--lakeflow-connect-log-based). |
 | Source disk filling up during CDC | A replication slot with no live consumer. Restart the gateway, or drop the slot with `pg_drop_replication_slot`. |
+| `uv add dbt-core dbt-databricks` will not resolve | `dbt-databricks` 1.12.4 needs `dbt-core>=1.11.2,<1.12.1`. Install `"dbt-core<1.12"` — see [the version pin](#1-pin-dbt-core-below-112-or-resolution-fails). |
+| `dbt --version` says dbt-core is out of date | Expected and correct. The pin exists because the adapter cannot use 1.12.x. Do not upgrade. |
+| `dbt init` created `dbt/tesco/` instead of using `dbt/` | Expected — it always makes a subdirectory. Flatten it: `mv tesco/* tesco/.[!.]* . && rmdir tesco`. See [scaffolding](#2-scaffold-the-project-then-flatten-it). |
+| `CERTIFICATE_VERIFY_FAILED ... self-signed certificate in certificate chain` | Framework Python has no CA bundle. Run `Install Certificates.command` — see [the certificate error](#4-the-certificate-error-and-the-one-command-that-fixes-it). Not a proxy, not your token. |
+| `dbt debug` hangs for ~15 minutes, then `Retry policy max retry duration of 900.0 seconds` | Same certificate problem — the SQL connector retries the failed TLS handshake before reporting it. Fix the trust store. |
+| dbt works in the terminal but fails inside VS Code | You patched `SSL_CERT_FILE` in your shell profile; the extension host never reads it. Fix the trust store instead — see [the certificate error](#4-the-certificate-error-and-the-one-command-that-fixes-it). |
+| dbt Power User reports dbt is not installed | It runs dbt from the interpreter the Python extension selected. Pick `.venv/bin/python` at the repo root, or set `dbt.dbtPythonPathOverride` to its absolute path — see [VS Code](#5-vs-code-the-dbt-power-user-extension). |
+| `Could not find profile named` / dbt cannot find credentials | Run dbt from `dbt/`, or pass `--profiles-dir dbt`. `dbt/profiles.yml` is git-ignored; copy it from `profiles.yml.example` — see [where it lives](#3-where-profilesyml-lives). |
 
 ---
 
@@ -562,7 +858,7 @@ spaces and no column alignment padding.
 - [x] Local Postgres via Docker, schema generated from the CSVs
 - [x] Load to hosted Postgres (Supabase, or any public Postgres)
 - [ ] **CDC into a Databricks catalog** ← current stage
-- [ ] Bronze → silver transformations, with data quality expectations
+- [ ] Bronze → silver transformations in dbt, with data quality expectations
 - [ ] Gold-layer dimensional model (star schema over orders)
 - [ ] Orchestration and scheduling
 - [ ] Tests and data quality gates in CI
