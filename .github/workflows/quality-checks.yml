@@ -3,7 +3,7 @@ name: Quality checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   pre-commit:
@@ -25,17 +25,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Block large binaries outside git-lfs
         run: |
-          git diff --name-only origin/main...HEAD | while read -r f; do
-            if [ -f "$f" ]; then
-              size=$(stat -c%s "$f")
-              if [ "$size" -gt 5000000 ]; then
-                echo "::error file=$f::File exceeds 5MB - use git-lfs or DVC for mlflow artefacts instead of committing directly."
-                exit 1
-              fi
-            fi
-          done
+          # Blob sizes are read straight from the object database, so this needs
+          # no diff range and no full history: it behaves identically on pushes
+          # and on pull requests. `git ls-tree -l` emits
+          # "<mode> <type> <sha> <size>\t<path>", so the path is whatever
+          # follows the tab - safe for paths containing spaces.
+          oversized=$(git ls-tree -r -l HEAD | awk -F'\t' '
+            { split($1, meta, " ") }
+            meta[4] + 0 > 5000000 { printf "%s\t%s\n", meta[4], $2 }
+          ')
+          if [ -n "$oversized" ]; then
+            while IFS=$'\t' read -r size path; do
+              echo "::error file=$path::File is $size bytes, over the 5MB limit - use git-lfs or DVC for mlflow artefacts instead of committing directly."
+            done <<< "$oversized"
+            exit 1
+          fi
