@@ -1,5 +1,5 @@
-SELECT
-    DISTINCT employee_id,
+SELECT DISTINCT
+    employee_id,
     employee_first_name,
     employee_last_name,
     employee_email,

@@ -1,5 +1,5 @@
-SELECT
-    DISTINCT order_id,
+SELECT DISTINCT
+    order_id,
     payment_method,
     order_status,
     order_timestamp,

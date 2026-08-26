@@ -15,10 +15,11 @@ FROM
 {% if is_incremental() %}
 
     WHERE updated_timestamp > (
-        SELECT COALESCE(
-            MAX(updated_timestamp),
-            '1900-01-01'
-        )
+        SELECT
+            COALESCE(
+                MAX(updated_timestamp),
+                '1900-01-01'
+            )
         FROM {{ this }}
     )
 

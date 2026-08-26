@@ -1,5 +1,5 @@
-SELECT
-    DISTINCT customer_id,
+SELECT DISTINCT
+    customer_id,
     customer_first_name,
     customer_last_name,
     customer_email,

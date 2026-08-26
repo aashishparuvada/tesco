@@ -1,7 +1,7 @@
 sources:
   - name: tesco_databricks
-    database: tesco  
-    schema: bronze  
+    database: tesco
+    schema: bronze
     tables:
       - name: orders
       - name: customers

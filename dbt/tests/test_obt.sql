@@ -9,13 +9,13 @@ FROM
     {{ ref('obt') }} AS obt
 WHERE
     obt.order_id IS NULL
-OR
+    OR
     obt.product_id IS NULL
-OR
+    OR
     obt.customer_id IS NULL
-OR
+    OR
     obt.order_item_id IS NULL
-OR
+    OR
     obt.employee_id IS NULL
-OR
+    OR
     obt.store_id IS NULL

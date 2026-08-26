@@ -1,5 +1,5 @@
-SELECT
-    DISTINCT product_id,
+SELECT DISTINCT
+    product_id,
     product_name,
     category,
     brand,
