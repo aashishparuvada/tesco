@@ -1,0 +1,11 @@
+sources:
+  - name: tesco_databricks
+    database: tesco  
+    schema: bronze  
+    tables:
+      - name: orders
+      - name: customers
+      - name: products
+      - name: order_items
+      - name: employees
+      - name: stores

@@ -5,6 +5,72 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-08-26
+
+Fills the empty dbt project with a model layer. Adds the six bronze source
+declarations, six incremental silver models that merge on their primary key and
+advance on `updated_timestamp`, a Jinja-generated one-big-table, generic and
+singular tests, and the schema-name macro that stops dbt prefixing every schema
+with the target name.
+
+### Added
+
+- `dbt/models/source/sources.yml` — declares the six Stage 2 bronze tables
+  (`orders`, `customers`, `products`, `order_items`, `employees`, `stores`) as
+  the `tesco_databricks` source, pointing at `tesco.bronze`. Every model reads
+  through `source()` rather than hard-coding the catalog, so the bronze location
+  moves in one file.
+- `dbt/models/silver/*.sql` — one incremental model per source table. Each is
+  `materialized = 'incremental'` with `incremental_strategy = 'merge'` and the
+  table's own `*_id` as `unique_key`, selects `*` plus a `CURRENT_TIMESTAMP()
+  AS processed_at` audit column, and on incremental runs filters to rows newer
+  than `MAX(updated_timestamp)` already in `{{ this }}`. The `COALESCE(...,
+  '1900-01-01')` fallback is what makes the first incremental run after a
+  `--full-refresh` behave: an empty high-water mark would otherwise compare
+  against `NULL` and select nothing. `is_active` is carried through unchanged —
+  soft deletes stay a downstream decision.
+- `dbt/models/silver/obt.sql` — a One Big Table over the six silver models,
+  built from a Jinja `configs` list rather than hand-written SQL. Each entry
+  carries its model name, its aliased column list, and its join condition; the
+  model body loops over that list to emit the `SELECT` and a chain of `LEFT
+  JOIN`s anchored on `orders`. Adding a dimension to the OBT means adding one
+  dict, not editing two places. Tables are resolved with `ref()` inside the
+  loop, so dbt records all six silver models as upstream edges and orders the
+  build itself — and the relations resolve per target instead of pinning a dev
+  run to production `silver`. The loop variable is `cfg` rather than `config`,
+  which would shadow dbt's own context object. Overlapping column names are aliased by entity
+  (`customer_email`, `employee_email`; `customer_city`, `store_city`), and every
+  source table's `created_timestamp` / `updated_timestamp` / `is_active` /
+  `processed_at` survives with an entity prefix, so lineage back to bronze is
+  not lost in the flattening.
+- `dbt/models/silver/properties.yml` — generic tests: `not_null` and `unique` on
+  `orders.order_id`, and the same pair on `products.product_id` with the
+  uniqueness check scoped by `config: where: "price > 0"`.
+- `dbt/tests/test_obt.sql` — a singular test asserting no row of `obt` has a
+  `NULL` key (`order_id`, `product_id`, `customer_id`, `order_item_id`,
+  `employee_id`, `store_id`). Set to `severity='warn'`: the joins are `LEFT`, so
+  an orphan is a fact about the data worth surfacing, not a reason to fail the
+  run.
+- `dbt/macros/custom_schema.sql` — overrides dbt's built-in
+  `generate_schema_name` to return the custom schema verbatim instead of
+  `<target_schema>_<custom_schema>`. Without it, `+schema: silver` produces
+  `default_silver`, and the medallion layers do not line up with the catalog.
+- `dbt/analyses/`, `dbt/macros/`, `dbt/seeds/`, `dbt/snapshots/`, `dbt/tests/` —
+  `.gitkeep` files so the scaffolded layout survives a clone.
+- `README.md` — new **The silver layer in dbt** section covering the source
+  declaration, the incremental + merge pattern and why the watermark is written
+  the way it is, the schema-name macro, the OBT generator and how to verify its
+  `ref()` edges with `dbt ls --select +obt`, and the two kinds of test. Plus new
+  **What you will learn** rows and Troubleshooting entries.
+
+### Changed
+
+- `dbt/dbt_project.yml` — replaced the `example: +materialized: view` stub left
+  by `dbt init` with a real `silver` config: materialized as `table`, into
+  schema `silver`.
+- `.vscode/settings.json` — added `dbt.perspectiveTheme: "Pro Dark"` so dbt
+  Power User's query results panel matches a dark editor theme.
+
 ## [1.3.0] - 2026-08-25
 
 Begins the transformation layer. Adds dbt with the Databricks adapter and
@@ -326,6 +392,7 @@ The dataset was generated on par to a UK/Tesco context:
   `product_id`, `order_id`, `order_item_id`) are surrogate integers starting at
   1 and are stable — downstream scripts can rely on them.
 
+[1.3.1]: https://github.com/aashishparuvada/tesco/
 [1.3.0]: https://github.com/aashishparuvada/tesco/
 [1.2.0]: https://github.com/aashishparuvada/tesco/
 [1.1.0]: https://github.com/aashishparuvada/tesco/

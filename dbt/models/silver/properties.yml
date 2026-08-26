@@ -1,0 +1,16 @@
+models:
+  - name: products
+    columns:
+      - name: product_id
+        data_tests:
+          - not_null
+          - unique:
+              config:
+                where: "price > 0"
+
+  - name: orders
+    columns:
+      - name: order_id
+        data_tests:
+          - not_null
+          - unique

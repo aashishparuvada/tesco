@@ -11,7 +11,9 @@ README says so plainly instead of letting you discover it halfway through.
 
 > **Status:** Stages 0 and 1 are implemented and verified. Stage 2 (CDC into
 > Databricks) is the stage currently being built — this README documents the
-> design and the setup you need, and will be updated as the pipeline lands.
+> design and the setup you need, and will be updated as the pipeline lands. The
+> dbt silver layer that sits on top of it is written and reviewable now; it runs
+> the moment bronze exists.
 
 ---
 
@@ -26,6 +28,7 @@ README says so plainly instead of letting you discover it halfway through.
 - [Stage 1 — Push to a hosted Postgres](#stage-1--push-to-a-hosted-postgres)
 - [Stage 2 — CDC from Postgres into Databricks](#stage-2--cdc-from-postgres-into-databricks)
 - [Setting up dbt for Databricks](#setting-up-dbt-for-databricks)
+- [The silver layer in dbt](#the-silver-layer-in-dbt)
 - [Repository layout](#repository-layout)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
@@ -43,6 +46,10 @@ README says so plainly instead of letting you discover it halfway through.
 | Moving from local to hosted Postgres | Same code, different connection |
 | Change Data Capture | Postgres logical replication (WAL) into Delta tables |
 | Medallion architecture | `raw_data` → bronze → silver / gold in Unity Catalog |
+| Incremental models and `MERGE` | Silver models merge on their primary key, not append |
+| Watermarking an incremental load | `is_incremental()` plus a `COALESCE`d `MAX(updated_timestamp)` |
+| Generating SQL with Jinja | The OBT declares its joins as data and loops over them |
+| Data quality testing | Generic tests in YAML, singular tests as queries, `warn` vs `error` |
 | The gap between docs and reality | Network, tier, and quota limits that block the happy path |
 
 That last row is not filler. Most of the difficulty in this project is not
@@ -745,7 +752,8 @@ tesco/
 ```json
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-  "files.associations": { "dbt/**/*.sql": "jinja-sql" }
+  "files.associations": { "dbt/**/*.sql": "jinja-sql" },
+  "dbt.perspectiveTheme": "Pro Dark"
 }
 ```
 
@@ -782,6 +790,360 @@ variable will not work there:
 
 ---
 
+## The silver layer in dbt
+
+With dbt connected, the project stops being a scaffold. This section is the
+model layer: six incremental silver models over the bronze tables Stage 2 lands,
+a generated one-big-table on top of them, and the tests that keep both honest.
+
+> [!NOTE]
+> These models read from `tesco.bronze`, which **Stage 2 produces**. Until the
+> CDC pipeline has landed those tables, `dbt run` will fail with *"Table or view
+> not found"* — that is expected, not a broken model. `dbt parse` and
+> `dbt compile` work regardless, so you can develop and review the SQL before
+> the data exists.
+
+### 1. Declare the sources, do not hard-code the catalog
+
+`dbt/models/source/sources.yml` names the six bronze tables once:
+
+```yaml
+sources:
+  - name: tesco_databricks
+    database: tesco
+    schema: bronze
+    tables:
+      - name: orders
+      - name: customers
+      - name: products
+      - name: order_items
+      - name: employees
+      - name: stores
+```
+
+Every model then reads `{{ source('tesco_databricks', 'orders') }}` rather than
+`tesco.bronze.orders`. Two things fall out of that. dbt now knows bronze is
+upstream, so `dbt run --select source:tesco_databricks+` and the lineage graph
+work. And if bronze ever moves catalog or schema, it moves in this one file
+instead of in six.
+
+### 2. Silver: incremental models that merge on the primary key
+
+All six silver models are the same shape. `dbt/models/silver/customers.sql` in
+full:
+
+```sql
+{{
+  config(
+        materialized = 'incremental',
+        incremental_strategy = 'merge',
+        unique_key = 'customer_id'
+    )
+}}
+
+SELECT
+    *,
+    CURRENT_TIMESTAMP() AS processed_at
+FROM
+    {{ source('tesco_databricks', 'customers') }}
+
+{% if is_incremental() %}
+
+    WHERE updated_timestamp > (
+        SELECT COALESCE(
+            MAX(updated_timestamp),
+            '1900-01-01'
+        )
+        FROM {{ this }}
+    )
+
+{% endif %}
+```
+
+The other five differ only in the source table and the `unique_key`
+(`order_id`, `product_id`, `order_item_id`, `employee_id`, `store_id`).
+
+Four decisions worth understanding, because they are the whole pattern:
+
+**`materialized = 'incremental'`.** On the first run — or any run with
+`--full-refresh` — dbt creates the table from the full `SELECT`. On every run
+after that it runs the same `SELECT` and merges the result into the existing
+table. You are not rebuilding 30,000 order lines to pick up yesterday's changes.
+
+**`incremental_strategy = 'merge'` with a `unique_key`.** The default strategy
+would *append*, which turns every update into a duplicate row. `merge` compiles
+to a Delta `MERGE INTO ... ON target.customer_id = source.customer_id`, so a
+changed row updates in place and a new one inserts. This is the strategy that
+makes an incremental model idempotent: re-running it after a partial failure
+converges instead of doubling.
+
+**The `is_incremental()` watermark.** The `WHERE` clause only exists on
+incremental runs — on a full refresh the block is not rendered at all, because
+`{{ this }}` does not yet hold anything to compare against. When it does render,
+it limits the scan to rows whose `updated_timestamp` is newer than the newest
+one already in the target. This is what turns "merge the whole table every time"
+into "merge only what moved".
+
+**Why `COALESCE(..., '1900-01-01')`.** On the first *incremental* run after a
+full refresh the target could be empty, and `MAX(updated_timestamp)` over an
+empty table returns `NULL`. `updated_timestamp > NULL` is not false — it is
+`NULL`, which filters out **every** row, and the model silently loads nothing.
+The sentinel date guarantees the comparison is always against a real value. This
+is the single most common way a hand-written incremental model quietly does
+nothing, and it produces no error to tell you.
+
+`processed_at` is stamped with `CURRENT_TIMESTAMP()` on the way through, so
+every silver row records when dbt touched it — distinct from
+`created_timestamp` / `updated_timestamp`, which describe when the *source* row
+changed. The `is_active` flag is carried through untouched: silver is still a
+faithful copy, and deciding what a soft-deleted row means is a gold-layer
+concern.
+
+### 3. The macro that stops dbt renaming your schemas
+
+`dbt_project.yml` routes the models to a `silver` schema:
+
+```yaml
+models:
+  tesco:
+    silver:
+      +materialized: table
+      +schema: silver
+```
+
+By default that does **not** produce a schema called `silver`. dbt's built-in
+`generate_schema_name` concatenates, so `+schema: silver` against a target
+schema of `default` gives you `default_silver`. That behaviour exists so several
+developers can build into one warehouse without colliding, and it is exactly
+wrong for a medallion layout where `bronze`, `silver`, and `gold` are fixed
+names in the catalog.
+
+`dbt/macros/custom_schema.sql` overrides it:
+
+```sql
+{% macro generate_schema_name(custom_schema_name, node) -%}
+    {%- set default_schema = target.schema -%}
+    {%- if custom_schema_name is none -%}
+        {{ default_schema }}
+    {%- else -%}
+        {{ custom_schema_name | trim }}
+    {%- endif -%}
+{%- endmacro %}
+```
+
+A model with no `+schema` still lands in the target schema from
+`profiles.yml`; a model with one lands in exactly that schema, verbatim. dbt
+picks the macro up by name — there is nothing to register.
+
+> [!TIP]
+> Confirm it before you run anything expensive. `uv run dbt compile` then read
+> the header of `target/run/tesco/models/silver/customers.sql` — the fully
+> qualified name should be `tesco.silver.customers`, not
+> `tesco.default_silver.customers`.
+
+### 4. The OBT, generated instead of typed
+
+`dbt/models/silver/obt.sql` flattens all six silver models into one wide table
+for analysts who want to answer questions without writing a six-way join. Doing
+that by hand is roughly 70 columns of aliased `SELECT` list and five `LEFT
+JOIN`s — tedious to write and worse to review, because the column list and the
+join list drift apart.
+
+Instead the model declares the joins as data:
+
+```sql
+{% set configs = [
+    {
+        "model": "orders",
+        "columns": """ o.order_id, o.store_id, o.order_timestamp, ... """,
+        "alias": "o"
+    },
+    {
+        "model": "customers",
+        "columns": """ c.customer_id, c.first_name AS customer_first_name, ... """,
+        "alias": "c",
+        "join_condition": "o.customer_id = c.customer_id"
+    },
+    ...
+] %}
+
+SELECT
+    {% for cfg in configs %}
+        {{ cfg['columns'] }}{% if not loop.last %},{% endif %}
+    {% endfor %}
+FROM
+    {% for cfg in configs %}
+        {% if loop.first %}
+            {{ ref(cfg['model']) }} AS {{ cfg['alias'] }}
+        {% else %}
+LEFT JOIN
+        {{ ref(cfg['model']) }} AS {{ cfg['alias'] }}
+        ON {{ cfg['join_condition'] }}
+        {% endif %}
+    {% endfor %}
+```
+
+The first entry is the anchor and gets no `join_condition`; every other entry
+contributes one `LEFT JOIN`. Adding a dimension to the OBT is one dict, and the
+column list and the join cannot fall out of sync because they are the same
+object.
+
+**The tables come from `ref()`, not from hard-coded names,** and that matters
+more than it looks. dbt builds its DAG by instrumenting `ref()` during the parse
+phase: every call is recorded as an edge and returns a `Relation` that renders
+to the fully-qualified name. Because the `{% set %}` block and the loop always
+evaluate, a `ref()` buried inside a loop over a dict registers exactly as a
+top-level one would. Two consequences:
+
+- **dbt orders the build for you.** `dbt run` builds the six silver models
+  before the OBT; `dbt build --select +obt` selects the whole upstream chain;
+  `dbt run --select customers+` rebuilds customers and everything downstream.
+  Hard-coded names produce an orphan node that dbt will happily build *first*,
+  against yesterday's data.
+- **It resolves per target.** `tesco.silver.orders` written out literally means a
+  dev run building into `tesco.dev_silver` still reads *production* silver —
+  silently, with no error. `ref()` goes through the same
+  `generate_schema_name` macro the silver models do, so dev reads dev.
+
+One cost, worth knowing and not worth avoiding: `ref()` with a variable argument
+defeats dbt's fast static parser, so this model falls back to full Jinja
+rendering at parse time. That is milliseconds, and it changes nothing about the
+compiled SQL.
+
+> [!TIP]
+> **Confirm the edges actually registered — before you need them.** A `ref()`
+> that never renders produces no error, just a silently orphaned node, so check
+> the DAG rather than trusting the SQL. Neither command touches the warehouse:
+>
+> ```bash
+> cd dbt
+> uv run dbt ls --select +obt --resource-type model --output name
+> ```
+>
+> The `+` prefix means *"this node and everything upstream of it"*. If `ref()`
+> is wired up, all six silver models come back alongside the OBT:
+>
+> ```
+> customers
+> employees
+> obt
+> order_items
+> orders
+> products
+> stores
+> ```
+>
+> If it prints `obt` on its own, the model is an orphan and dbt is free to build
+> it before the tables it reads. Drop `--resource-type model` to see the whole
+> upstream chain — the six bronze sources as `tesco_databricks.*`, and the tests
+> that will run against them:
+>
+> ```bash
+> uv run dbt ls --select +obt --output name
+> ```
+>
+> To see the resolved SQL rather than the graph, `uv run dbt compile --select
+> obt` and read `target/compiled/tesco/models/silver/obt.sql` — the `FROM` and
+> `LEFT JOIN` clauses should name `` `tesco`.`silver`.`orders` `` and friends,
+> fully qualified and backtick-quoted by the adapter.
+
+The loop variable is `cfg`, not `config`, deliberately — `config` is dbt's own
+context object, and shadowing it inside the loop would break any later
+`{{ config.get(...) }}` in the same block in a way that is genuinely hard to
+spot.
+
+Two details in the column lists are deliberate:
+
+- **Collisions are aliased by entity.** `customers`, `employees`, and `stores`
+  all have a `city`; two have an `email` and a `first_name`. They come out as
+  `customer_city` / `store_city`, `customer_email` / `employee_email`, and so
+  on. Without this the model fails to build, or worse, builds with ambiguous
+  duplicates.
+- **The audit columns survive the flattening.** Each entity's
+  `created_timestamp`, `updated_timestamp`, `is_active`, and `processed_at` are
+  carried through prefixed (`order_is_active`, `product_processed_at`, …), and
+  the last entry adds `CURRENT_TIMESTAMP() AS obt_processed_at`. A wide table
+  that has lost its provenance cannot be reconciled against bronze; this one can.
+
+The joins are `LEFT` on purpose. An order line whose product row has not
+replicated yet should still appear in the OBT with `NULL` product columns,
+rather than vanishing from the analysts' table because of a race in the CDC
+feed. That choice is what the OBT test below exists to police.
+
+### 5. Two kinds of test
+
+**Generic tests**, in `dbt/models/silver/properties.yml`, are the declarative
+ones dbt ships with:
+
+```yaml
+models:
+  - name: products
+    columns:
+      - name: product_id
+        data_tests:
+          - not_null
+          - unique:
+              config:
+                where: "price > 0"
+
+  - name: orders
+    columns:
+      - name: order_id
+        data_tests:
+          - not_null
+          - unique
+```
+
+The `where` on the products uniqueness check is worth noticing: it scopes the
+test to priced rows, which is how you assert a rule that genuinely only holds
+for part of the table without either weakening it everywhere or failing the run
+on rows it was never meant to cover.
+
+**Singular tests** are just a query that should return no rows.
+`dbt/tests/test_obt.sql` checks that the OBT's keys all survived their joins:
+
+```sql
+{{ config(severity='warn') }}
+
+SELECT 1
+FROM {{ ref('obt') }} AS obt
+WHERE obt.order_id IS NULL
+   OR obt.product_id IS NULL
+   OR obt.customer_id IS NULL
+   OR obt.order_item_id IS NULL
+   OR obt.employee_id IS NULL
+   OR obt.store_id IS NULL
+```
+
+`severity='warn'` is the point of it. Because the joins are `LEFT`, a `NULL`
+key means a real referential gap in the source data — an order whose customer
+has not arrived, an order line pointing at a product that was deleted. You want
+to *know* that, and you do not want it to fail the build and block every
+downstream model, because the gap may well be legitimate mid-replication. Warn,
+look, then decide.
+
+Run them:
+
+```bash
+cd dbt
+uv run dbt run                 # build silver, then the OBT
+uv run dbt test                # generic + singular tests
+uv run dbt build               # or: run and test model by model, in DAG order
+```
+
+`dbt build` is usually what you want day to day — it tests each model as soon as
+it is built, so a broken model stops its own dependents instead of poisoning
+them.
+
+> [!TIP]
+> `dbt run` on a model whose SQL you just changed will **merge into the old
+> table**, because incremental models do not notice that their definition moved.
+> After editing a silver model, run `uv run dbt run --full-refresh --select
+> customers` to rebuild it from scratch. Forgetting this is why a column you
+> just added shows up empty.
+
+---
+
 ## Repository layout
 
 ```
@@ -795,7 +1157,14 @@ tesco/
 │   └── sql/
 │       └── raw_data/ddl.sql       # GENERATED - do not edit by hand
 ├── dbt/
-│   ├── models/                    # dbt models (Databricks target)
+│   ├── models/
+│   │   ├── source/sources.yml     # The six bronze tables, declared once
+│   │   └── silver/                # Incremental models + the generated OBT
+│   │       ├── customers.sql      # (one per source table)
+│   │       ├── obt.sql            # One Big Table, joins declared as data
+│   │       └── properties.yml     # Generic tests: not_null, unique
+│   ├── macros/custom_schema.sql   # generate_schema_name override
+│   ├── tests/test_obt.sql         # Singular test: no NULL keys in the OBT
 │   ├── dbt_project.yml
 │   ├── profiles.yml.example       # Copy to profiles.yml - GIT-IGNORED
 │   └── profiles.yml               # Your host / http_path / token - never committed
@@ -849,6 +1218,13 @@ spaces and no column alignment padding.
 | dbt works in the terminal but fails inside VS Code | You patched `SSL_CERT_FILE` in your shell profile; the extension host never reads it. Fix the trust store instead — see [the certificate error](#4-the-certificate-error-and-the-one-command-that-fixes-it). |
 | dbt Power User reports dbt is not installed | It runs dbt from the interpreter the Python extension selected. Pick `.venv/bin/python` at the repo root, or set `dbt.dbtPythonPathOverride` to its absolute path — see [VS Code](#5-vs-code-the-dbt-power-user-extension). |
 | `Could not find profile named` / dbt cannot find credentials | Run dbt from `dbt/`, or pass `--profiles-dir dbt`. `dbt/profiles.yml` is git-ignored; copy it from `profiles.yml.example` — see [where it lives](#3-where-profilesyml-lives). |
+| `Table or view not found: tesco.bronze.*` | Stage 2 has not landed the bronze tables yet. Expected until CDC runs — `dbt compile` still works. |
+| Silver tables land in `<target_schema>_silver` | dbt's default `generate_schema_name` concatenates. The `custom_schema.sql` macro overrides it — see [the schema macro](#3-the-macro-that-stops-dbt-renaming-your-schemas). |
+| An incremental model loads zero rows on its first incremental run | `MAX(updated_timestamp)` over an empty table is `NULL`, and `x > NULL` matches nothing. Keep the `COALESCE(..., '1900-01-01')` — see [the watermark](#2-silver-incremental-models-that-merge-on-the-primary-key). |
+| A column you just added to a model is empty | Incremental models merge into the existing table. Rebuild with `dbt run --full-refresh --select <model>`. |
+| Rows duplicate on every run | The model lost `incremental_strategy = 'merge'` or its `unique_key`; the default strategy appends. |
+| `test_obt` warns about `NULL` keys | Working as intended. The OBT uses `LEFT JOIN`, so a `NULL` key is a real referential gap in the source, surfaced at `warn` rather than failing the build. |
+| `sqlfluff` fails on dbt models in pre-commit | Layout rules, not SQL errors. `sqlfluff-fix` runs in the same hook and rewrites them; re-stage and commit again. |
 
 ---
 
@@ -858,7 +1234,7 @@ spaces and no column alignment padding.
 - [x] Local Postgres via Docker, schema generated from the CSVs
 - [x] Load to hosted Postgres (Supabase, or any public Postgres)
 - [ ] **CDC into a Databricks catalog** ← current stage
-- [ ] Bronze → silver transformations in dbt, with data quality expectations
+- [ ] **Bronze → silver transformations in dbt, with data quality expectations** — models, the OBT, and the tests are written; they run once Stage 2 lands bronze
 - [ ] Gold-layer dimensional model (star schema over orders)
 - [ ] Orchestration and scheduling
 - [ ] Tests and data quality gates in CI
