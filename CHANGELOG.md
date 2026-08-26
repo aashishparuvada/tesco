@@ -5,6 +5,52 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-08-26
+
+Builds the gold layer on top of the OBT: five ephemeral shaping models feeding
+SCD Type 2 dimension snapshots, and an order-item-grain fact table
+materialized directly instead of ephemerally. Documents both in the README
+alongside the silver layer.
+
+### Added
+
+- `dbt/models/gold/ephemeral/*.sql` — one ephemeral model per dimension
+  (`eph_customers`, `eph_employees`, `eph_orders`, `eph_products`,
+  `eph_stores`), each a `SELECT DISTINCT` off `obt` plus a
+  `*_gold_processed_at` audit column. `dbt_project.yml` marks the whole
+  `ephemeral/` subtree `+materialized: ephemeral`, so none of the five ever
+  builds a table or view — each inlines as a CTE inside whatever `ref()`s it.
+  `eph_orders` deliberately omits `order_item_id`: it is order-item grain, and
+  keeping it in a row-wide `DISTINCT` would produce more than one row per
+  `order_id` for any multi-line order, violating `dim_orders`'s
+  `unique_key: order_id`.
+- `dbt/snapshots/dim_*.yml` — one YAML snapshot config per dimension
+  (`dim_customers`, `dim_employees`, `dim_orders`, `dim_products`,
+  `dim_stores`), `strategy: timestamp` keyed on the entity's `*_id` and
+  `*_updated_timestamp`, `dbt_valid_to_current: "to_date('9999-12-31')"` so the
+  current row's `dbt_valid_to` is a sentinel date rather than `NULL`.
+  `relation: ref('eph_*')` targets the ephemeral models above; since those have
+  no physical relation, dbt inlines their compiled SQL directly into the
+  snapshot's own query.
+- `dbt/models/gold/fact/fact_orders.sql` — the fact table, at order-item grain,
+  carrying an FK to all five dimensions plus the order and line-item measures.
+  Ships with no `config()` block: it inherits `+materialized: table` from
+  `dbt_project.yml`'s `gold:` block, the same default the `ephemeral/` subtree
+  overrides for itself.
+- `README.md` — new **The gold layer in dbt** section: why the ephemeral
+  models never materialize, the snapshot config and the SCD Type 2 mechanics
+  behind it, why the fact table is a plain model instead of an ephemeral one,
+  the path-based `dbt_project.yml` config that decides between the two, and
+  the `dbt run` vs `dbt snapshot` vs `dbt build` gotcha. Plus new **What you
+  will learn** rows, `Repository layout` entries for `gold/` and
+  `snapshots/`, two new Troubleshooting rows, and an updated Roadmap line.
+
+### Changed
+
+- `dbt/dbt_project.yml` — added a `gold:` block (`+materialized: table`,
+  `+schema: gold`) with a nested `ephemeral:` override
+  (`+materialized: ephemeral`) scoped to `models/gold/ephemeral/`.
+
 ## [1.3.1] - 2026-08-26
 
 Fills the empty dbt project with a model layer. Adds the six bronze source

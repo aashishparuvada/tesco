@@ -12,8 +12,8 @@ README says so plainly instead of letting you discover it halfway through.
 > **Status:** Stages 0 and 1 are implemented and verified. Stage 2 (CDC into
 > Databricks) is the stage currently being built — this README documents the
 > design and the setup you need, and will be updated as the pipeline lands. The
-> dbt silver layer that sits on top of it is written and reviewable now; it runs
-> the moment bronze exists.
+> dbt silver and gold layers that sit on top of it are written and reviewable
+> now; they run the moment bronze exists.
 
 ---
 
@@ -29,6 +29,7 @@ README says so plainly instead of letting you discover it halfway through.
 - [Stage 2 — CDC from Postgres into Databricks](#stage-2--cdc-from-postgres-into-databricks)
 - [Setting up dbt for Databricks](#setting-up-dbt-for-databricks)
 - [The silver layer in dbt](#the-silver-layer-in-dbt)
+- [The gold layer in dbt](#the-gold-layer-in-dbt)
 - [Repository layout](#repository-layout)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
@@ -50,6 +51,9 @@ README says so plainly instead of letting you discover it halfway through.
 | Watermarking an incremental load | `is_incremental()` plus a `COALESCE`d `MAX(updated_timestamp)` |
 | Generating SQL with Jinja | The OBT declares its joins as data and loops over them |
 | Data quality testing | Generic tests in YAML, singular tests as queries, `warn` vs `error` |
+| Ephemeral models | Gold dimension shaping queries that never materialize, only inline |
+| Slowly changing dimensions | `dbt snapshot` (Type 2) turns an ephemeral query into a versioned table |
+| Path-based model config | `dbt_project.yml` sets materialization per directory, not per file |
 | The gap between docs and reality | Network, tier, and quota limits that block the happy path |
 
 That last row is not filler. Most of the difficulty in this project is not
@@ -1047,6 +1051,24 @@ compiled SQL.
 > `LEFT JOIN` clauses should name `` `tesco`.`silver`.`orders` `` and friends,
 > fully qualified and backtick-quoted by the adapter.
 
+**The lineage graph is generated, not committed.** `target/` — where
+`dbt ls`/`dbt compile` above write `manifest.json`, the DAG dbt docs renders —
+is git-ignored, same as `dbt_packages/` and `logs/`: disposable build output
+that would otherwise just be merge-conflict noise. Cloning the repo does not
+hand you a lineage graph; it hands you the `ref()`/`source()` calls the graph
+is built from, and you regenerate it locally:
+
+```bash
+cd dbt
+uv run dbt docs generate        # writes target/manifest.json + target/catalog.json
+uv run dbt docs serve           # opens the lineage graph at localhost:8080
+```
+
+`docs generate` needs a live warehouse connection to fill in `catalog.json`
+(unlike `dbt ls`/`dbt compile`, which are connection-free) — if Stage 2 hasn't
+landed bronze yet, expect the same *"Table or view not found"* situation
+called out above for `dbt run`.
+
 The loop variable is `cfg`, not `config`, deliberately — `config` is dbt's own
 context object, and shadowing it inside the loop would break any later
 `{{ config.get(...) }}` in the same block in a way that is genuinely hard to
@@ -1144,6 +1166,151 @@ them.
 
 ---
 
+## The gold layer in dbt
+
+Gold turns the OBT into a small star schema: five Type 2 dimensions and one
+fact table, in `dbt/models/gold/`. The two halves are built differently on
+purpose — dimensions go through an ephemeral shaping model and a snapshot, the
+fact table does not — and that difference is declared once, by directory, in
+`dbt_project.yml`, not repeated in every file.
+
+### 1. Ephemeral models shape each dimension, they never materialize
+
+`dbt/models/gold/ephemeral/` has one model per dimension —
+`eph_customers.sql`, `eph_employees.sql`, `eph_products.sql`,
+`eph_stores.sql`, `eph_orders.sql` — each a `SELECT DISTINCT` of that entity's
+columns off the OBT, plus a `*_gold_processed_at` audit column:
+
+```sql
+SELECT
+    DISTINCT customer_id,
+    customer_first_name,
+    customer_last_name,
+    ...
+    customer_processed_at,
+    CURRENT_TIMESTAMP() AS customer_gold_processed_at
+FROM
+    {{ ref('obt') }}
+```
+
+`dbt_project.yml` marks everything under `models/gold/ephemeral/` as
+`+materialized: ephemeral`. An ephemeral model builds **nothing** — no table, no
+view, not even a temp object. dbt inlines its compiled `SELECT` as a CTE
+wherever it is `ref()`'d, and only exists in that context. `eph_customers` has
+no independent existence to query; it is a shaping step with exactly one
+consumer, so there is nothing to gain from materializing a throwaway table in
+`gold` on the way to the dimension that actually matters.
+
+> [!NOTE]
+> `eph_orders.sql` does not select `order_item_id`, even though it is on the
+> OBT. `order_item_id` is order-item grain, not order grain; keeping it in a
+> `DISTINCT` over `order_id` would produce more than one row per order for any
+> order with multiple line items — silently violating `dim_orders`'s
+> `unique_key: order_id` below. Order-item grain belongs to `fact_orders`, not
+> to a dimension.
+
+### 2. Snapshots turn the ephemeral models into SCD Type 2 dimensions
+
+`dbt/snapshots/dim_customers.yml` (one per dimension, same shape):
+
+```yaml
+snapshots:
+  - name: dim_customers
+    relation: ref('eph_customers')
+    description: Dimension Table for Customers
+    config:
+      database: tesco
+      schema: gold
+      strategy: timestamp
+      unique_key: customer_id
+      updated_at: customer_updated_timestamp
+      dbt_valid_to_current: "to_date('9999-12-31')"
+```
+
+This is the YAML snapshot config dbt-core added in 1.9 — no `{% snapshot %}`
+block in a `.sql` file, just `relation:` pointing at a `ref()`. `strategy:
+timestamp` diffs incoming rows against the last snapshot by comparing
+`updated_at`; a changed row gets a new version instead of overwriting the old
+one, which is what makes this Type 2 rather than Type 1. dbt adds
+`dbt_valid_from`, `dbt_valid_to`, and `dbt_scd_id` itself.
+`dbt_valid_to_current: "to_date('9999-12-31')"` gives the current version's
+`dbt_valid_to` an open-ended sentinel date instead of `NULL`, which BI tools
+querying `valid_from <= x AND valid_to > x` generally prefer.
+
+Because `eph_customers` is ephemeral, `relation: ref('eph_customers')` does not
+point at a real table — dbt inlines the ephemeral model's compiled SQL directly
+into the snapshot's own query at compile time. `dim_customers` is the only
+physical object either produces; `eph_customers` never independently exists in
+the warehouse, before or after the snapshot runs.
+
+### 3. The fact table is a regular model, not ephemeral
+
+`dbt/models/gold/fact/fact_orders.sql` has no `{{ config(...) }}` block at all:
+
+```sql
+SELECT
+    order_id,
+    order_item_id,
+    customer_id,
+    product_id,
+    store_id,
+    employee_id,
+    total_amount,
+    quantity,
+    unit_price,
+    line_amount
+FROM
+    {{ ref('obt') }}
+```
+
+`fact/` has no matching nested key in `dbt_project.yml`'s `gold:` block, so it
+falls through to that block's own `+materialized: table` and `+schema: gold` —
+the same defaults `models/gold/ephemeral/` overrides for its own directory.
+`fact_orders` lands as a real, queryable `tesco.gold.fact_orders` table. Unlike
+the dimension ephemerals, nothing downstream `ref()`s it into a further shaping
+step — it *is* the deliverable, at order-item grain, carrying an FK to each of
+the five dimensions — so there is no reason to make it ephemeral or to run it
+through a snapshot.
+
+### 4. Materialization is centralized in `dbt_project.yml`
+
+```yaml
+models:
+  tesco:
+    silver:
+      +materialized: table
+      +schema: silver
+    gold:
+      +materialized: table
+      +schema: gold
+      ephemeral:
+        +materialized: ephemeral
+```
+
+dbt's model config is path-based: the `gold:` block applies to every model
+under `models/gold/`, and a nested key matching a subdirectory name — here
+`ephemeral:` — overrides just that subtree. `models/gold/ephemeral/*.sql`
+inherits `+schema: gold` from the parent block too, but that setting is inert
+for an ephemeral model; there is no relation for a schema to apply to.
+`models/gold/fact/*.sql` has no matching nested key, so `fact_orders` gets the
+parent block's `table` / `gold` unchanged. This is why none of the six gold
+model files carry a `{{ config(...) }}` block — the split between "ephemeral
+shaping step" and "real table" is declared once, by directory, rather than
+copied into every file the way the silver section's `materialized =
+'incremental'` config is (each silver model repeats its own `config()` because
+each has its own `unique_key`; nothing gold-side varies per model, so it never
+drops below the directory level).
+
+> [!TIP]
+> **`dbt run` does not build snapshots.** It only builds models — the six
+> silver models, the OBT, and `fact_orders`, but not `dim_customers` and
+> friends. Populate the dimensions with `uv run dbt snapshot`, or use
+> `uv run dbt build`, which runs seeds, models, snapshots, and tests together
+> in DAG order. `dbt build` is the command to reach for once bronze exists —
+> it is the only one of the three that touches every gold object in one pass.
+
+---
+
 ## Repository layout
 
 ```
@@ -1159,10 +1326,14 @@ tesco/
 ├── dbt/
 │   ├── models/
 │   │   ├── source/sources.yml     # The six bronze tables, declared once
-│   │   └── silver/                # Incremental models + the generated OBT
-│   │       ├── customers.sql      # (one per source table)
-│   │       ├── obt.sql            # One Big Table, joins declared as data
-│   │       └── properties.yml     # Generic tests: not_null, unique
+│   │   ├── silver/                # Incremental models + the generated OBT
+│   │   │   ├── customers.sql      # (one per source table)
+│   │   │   ├── obt.sql            # One Big Table, joins declared as data
+│   │   │   └── properties.yml     # Generic tests: not_null, unique
+│   │   └── gold/
+│   │       ├── ephemeral/         # eph_*.sql - shaping queries, never materialize
+│   │       └── fact/fact_orders.sql   # Order-item grain, a real table
+│   ├── snapshots/dim_*.yml        # SCD Type 2 over the ephemeral models
 │   ├── macros/custom_schema.sql   # generate_schema_name override
 │   ├── tests/test_obt.sql         # Singular test: no NULL keys in the OBT
 │   ├── dbt_project.yml
@@ -1225,6 +1396,8 @@ spaces and no column alignment padding.
 | Rows duplicate on every run | The model lost `incremental_strategy = 'merge'` or its `unique_key`; the default strategy appends. |
 | `test_obt` warns about `NULL` keys | Working as intended. The OBT uses `LEFT JOIN`, so a `NULL` key is a real referential gap in the source, surfaced at `warn` rather than failing the build. |
 | `sqlfluff` fails on dbt models in pre-commit | Layout rules, not SQL errors. `sqlfluff-fix` runs in the same hook and rewrites them; re-stage and commit again. |
+| `dim_customers` (or any `dim_*`) is empty after `dbt run` | `dbt run` does not build snapshots. Run `uv run dbt snapshot`, or `uv run dbt build` — see [the gold layer](#4-materialization-is-centralized-in-dbt_projectyml). |
+| Selecting an ephemeral model directly (`dbt run --select eph_customers`) does nothing | Expected. Ephemeral models have no relation to build; they only compile as a CTE inside whatever `ref()`s them — see [ephemeral models](#1-ephemeral-models-shape-each-dimension-they-never-materialize). |
 
 ---
 
@@ -1235,7 +1408,7 @@ spaces and no column alignment padding.
 - [x] Load to hosted Postgres (Supabase, or any public Postgres)
 - [ ] **CDC into a Databricks catalog** ← current stage
 - [ ] **Bronze → silver transformations in dbt, with data quality expectations** — models, the OBT, and the tests are written; they run once Stage 2 lands bronze
-- [ ] Gold-layer dimensional model (star schema over orders)
+- [ ] **Gold-layer dimensional model (star schema over orders)** — five SCD Type 2 dimensions (ephemeral models + snapshots) and the order-item fact table are written; they run once Stage 2 lands bronze and silver builds
 - [ ] Orchestration and scheduling
 - [ ] Tests and data quality gates in CI
 

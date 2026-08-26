@@ -1,0 +1,11 @@
+snapshots:
+  - name: dim_products
+    relation: ref('eph_products')
+    description: Dimension Table for Products
+    config:
+      database: tesco
+      schema: gold
+      strategy: timestamp
+      unique_key: product_id
+      updated_at: product_updated_timestamp
+      dbt_valid_to_current: "to_date('9999-12-31')"
