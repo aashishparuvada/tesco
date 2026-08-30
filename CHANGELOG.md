@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-08-30
+
+Adds `guide.html`, a self-contained interactive walkthrough of the whole
+project. The README stays the reference document; the guide is the version you
+build from, sequenced as a path with a verification step after every command.
+
+### Added
+
+- `guide.html` — a single-file, dependency-free HTML guide (no build step,
+  nothing fetched at runtime beyond a Google Fonts stylesheet that degrades to
+  a local fallback stack, so it works offline and from `file://`). Sixteen
+  sections: an overview, thirteen numbered build steps, a filterable
+  troubleshooting reference, and a repository map.
+  - **Starts at the hosted database.** Stage 0's local Docker Postgres is
+    omitted deliberately — CDC needs a source Databricks can reach, so the
+    guide goes straight from the CSVs to a hosted Postgres. `load_data.py`
+    remains in the repo and in this README for local development.
+  - **Every step ends with a `Verify` block** giving the command to run and the
+    exact output to expect, so a mistake surfaces at the step that caused it
+    rather than eight steps later.
+  - Colour encodes the medallion layer — source, bronze, silver, gold,
+    orchestration — across the navigation rail, section eyebrows and controls,
+    so the layer you are working in is always visible.
+  - `⌘K` command palette searching every step, heading and troubleshooting
+    symptom; selecting a symptom opens the table with that filter applied.
+    Keyboard navigation (`←`/`→`, `/`, `T`), per-block copy buttons, tabbed
+    Path A / Path B for Stage 2, and collapsible deep dives.
+  - Progress and theme persist in `localStorage`; steps are deep-linkable by
+    `#id`; full light and dark themes, a responsive drawer layout under
+    1040px, `prefers-reduced-motion` support, and a print stylesheet that
+    expands every step.
+  - Syntax highlighting for SQL/Jinja, bash, YAML, JSON, Python and console
+    output is hand-rolled in the file itself — no CDN dependency.
+- `assets/images/guide.png` — the README preview of the guide, linked to
+  `guide.html`.
+
+### Changed
+
+- `README.md` — new **Start here: the interactive guide** section at the top,
+  with the preview image, how to open the file (GitHub renders it as source,
+  not as a page), and a table setting out what the guide does that a reference
+  document cannot. Added to the table of contents and to the repository layout.
+
 ## [1.4.0] - 2026-08-30
 
 Adds orchestration. `airflow/` runs the whole pipeline — trigger the existing

@@ -1,6 +1,6 @@
 [project]
 name = "tesco"
-version = "1.4.0"
+version = "1.5.0"
 description = "End-to-end data engineering project on a synthetic UK retail dataset: CSVs to Postgres to a Databricks catalog via CDC"
 readme = "README.md"
 requires-python = ">=3.12"

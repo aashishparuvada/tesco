@@ -17,8 +17,54 @@ README says so plainly instead of letting you discover it halfway through.
 
 ---
 
+## Start here: the interactive guide
+
+<a href="guide.html"><img src="assets/images/guide.png" alt="The Pipeline Field Guide - a self-contained, step-by-step HTML walkthrough of the whole project" width="100%"></a>
+
+**[`guide.html`](guide.html) is the recommended way to actually build this
+project.** It is a single self-contained file - no build step, no dependencies,
+nothing fetched at runtime - that turns everything below into a sequenced,
+checkable learning path.
+
+```bash
+git clone <your-fork-url> tesco
+open tesco/guide.html      # macOS; xdg-open on Linux, start on Windows
+```
+
+> [!NOTE]
+> GitHub renders `guide.html` as **source code**, not as a page. Clone the repo
+> or download the raw file, then open it in a browser.
+
+### Why the guide, and not this README
+
+| | This README | `guide.html` |
+| --- | --- | --- |
+| **Shape** | A reference document, read in any order | A path: 13 numbered steps, one screen at a time |
+| **Did that step work?** | You find out two stages later | Every step ends with a **Verify** block and the exact output to expect |
+| **Local Postgres** | Stage 0 comes first | Skipped entirely - straight to a hosted database, which is what CDC actually needs |
+| **Finding an error** | `Ctrl-F` through 1,600 lines | `⌘K` searches every step, heading and error message; the troubleshooting table filters live |
+| **Keeping your place** | Scroll and hope | Progress saves in your browser; **Resume** jumps to your next unfinished step |
+| **The two CDC paths** | Prose you have to hold in your head | A tabbed choice - free Path B up front, log-based Path A one click away |
+| **Reading it at 1am** | Whatever your viewer does | Full light and dark themes |
+
+It covers the same ground, in build order: the dataset and the three audit
+columns that make CDC possible, a hosted Postgres and the pooler trap, the
+schema-inferring loader, Databricks setup, what CDC is and the two vendor
+blockers, bronze via `AUTO CDC`, connecting dbt (including the certificate
+failure that costs everyone an afternoon), silver, the generated OBT, tests,
+the gold star schema, and the Airflow DAG - with the copy-paste command,
+the reason it exists, and the check that proves it worked, at every step.
+
+**Work through the guide and you should not need this README.** What stays
+useful here is everything a reference is better at: the full narrative behind
+each design decision, the complete troubleshooting table, the repository
+layout, and the roadmap. The guide teaches the build; this README specifies it.
+
+---
+
 ## Table of contents
 
+- [Start here: the interactive guide](#start-here-the-interactive-guide)
 - [What you will learn](#what-you-will-learn)
 - [Architecture](#architecture)
 - [The dataset](#the-dataset)
@@ -1533,6 +1579,7 @@ tesco/
 ├── .env.example                   # Every variable, documented
 ├── .pre-commit-config.yaml        # ruff, sqlfluff, gitleaks, hygiene
 ├── .github/workflows/             # CI runs the same hooks
+├── guide.html                     # The interactive guide - open it in a browser
 ├── CHANGELOG.md
 └── README.md
 ```
