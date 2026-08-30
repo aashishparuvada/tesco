@@ -5,6 +5,96 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-08-30
+
+Adds orchestration. `airflow/` runs the whole pipeline — trigger the existing
+Databricks bronze job, then silver, the OBT, and the gold layer — as one DAG
+on a hand-written, single-container Airflow stack, and documents both the
+`LocalExecutor`-vs-`CeleryExecutor` trade-off and the two setup mistakes made
+building it.
+
+### Added
+
+- `airflow/` — a self-contained Airflow 3.3.1 stack, run as its own
+  `docker compose` project separate from the repo-root Postgres one:
+  - `docker-compose.yaml` — two services (`postgres` for Airflow's metadata
+    DB, `airflow` for everything else), `command: standalone` with
+    `AIRFLOW__CORE__EXECUTOR: LocalExecutor`. Deliberately not the official
+    multi-service `CeleryExecutor` compose — one DAG has nothing for a worker
+    fleet to distribute. Mounts `../dbt:/opt/dbt` read-write so a
+    DAG-triggered `dbt run` writes `target/`, `logs/`, and `dbt_packages/`
+    into the same place a local run does.
+  - `Dockerfile` — `apache/airflow:3.3.1-python3.12` plus the same
+    `dbt-core<1.12` / `dbt-databricks>=1.12.4` pins as `pyproject.toml`, and
+    `databricks-sdk>=0.117.0`.
+  - `dags/orchestrate.py` — the `dbt_tesco_pipeline` DAG:
+    `databricks_ingest_cdc >> source_freshness >> silver >> silver_test >> obt
+    >> obt_test >> gold_ephemeral >> gold_dimensions >> gold_fact`. Every dbt
+    step is a `BashOperator` running `cwd='/opt/dbt/'`; `gold_dimensions` runs
+    `dbt snapshot` rather than `dbt run`, per [the gold layer](README.md#4-materialization-is-centralized-in-dbt_projectyml)'s
+    `dbt run` doesn't build snapshots note.
+  - `dags/utils.py` — `establish_databricks_connection()` and
+    `trigger_databricks_job(job_id)`, built directly on `databricks-sdk`'s
+    `WorkspaceClient` rather than the `apache-airflow-providers-databricks`
+    provider. `run_now(job_id=...)` starts the existing Databricks bronze job
+    (created in the workspace, not by this repo), then polls `get_run()`
+    every 5 seconds until a terminal `life_cycle_state`, raising on anything
+    other than `RunResultState.SUCCESS` so the DAG never proceeds to
+    `source_freshness` against a partially-written bronze table.
+  - `.env.example` — `AIRFLOW_METADATA_CONTAINER_NAME`, `AIRFLOW_CONTAINER_NAME`,
+    `AIRFLOW_PORT`, `AIRFLOW_UID`. `DATABRICKS_HOST` / `DATABRICKS_TOKEN` are
+    intentionally absent from the template — added directly to the
+    git-ignored `.env`, never example-shaped in git history.
+- `pyproject.toml` — `apache-airflow>=3.3.1`, `databricks-sdk>=0.117.0`,
+  `python-dotenv>=1.2.3` (the DAG's own package list, not shared with the
+  `.venv` Stage 0/1 loaders run in — see `airflow/Dockerfile`'s reasoning for
+  the separate image).
+- `README.md` — new **Orchestrating with Airflow** section: the DAG's task
+  chain, the `LocalExecutor`-vs-official-`CeleryExecutor` comparison and why
+  `LocalExecutor` is the right call here rather than a shortcut, the SDK-based
+  Databricks trigger and why it isn't a provider operator, the `.env`
+  gotcha below, and how to swap in the official `docker-compose.yaml` if you
+  outgrow one DAG. Plus a new **What you will learn** row, `Repository
+  layout` entries for `airflow/`, four new Troubleshooting rows, and an
+  updated Roadmap line.
+
+### Fixed
+
+- Editing `airflow/.env` to add `DATABRICKS_HOST` / `DATABRICKS_TOKEN` after
+  the `airflow` container already existed, then running `docker compose up
+  -d`, did not update the running container's environment —
+  `establish_databricks_connection()` kept raising `ValueError` as if the
+  file were empty. `env_file:` values are read at container **creation**;
+  editing the file's contents alone did not make Compose recreate an
+  already-running container the way editing `docker-compose.yaml` itself
+  does. Fixed by recreating the container outright: `cd airflow && docker
+  compose down && docker compose up -d --build` (`--build` also picked up
+  the Dockerfile's new `databricks-sdk` install in the same pass — a plain
+  `down`/`up` without it would have recreated the container from the old
+  image and failed with `ModuleNotFoundError: No module named 'databricks'`
+  instead).
+
+### Removed
+
+- `airflow-operators` from `pyproject.toml`. Added while exploring a
+  dedicated Databricks operator package; nothing in `airflow/dags` ends up
+  importing it once `utils.py` settled on calling `databricks-sdk` directly,
+  so it — and the transitive dependencies it alone pulled in
+  (`apache-airflow-providers-apache-kafka`, `apache-airflow-providers-mysql`,
+  `confluent-kafka`, `mysql-connector-python`) — is dropped rather than kept
+  as dead weight in `uv.lock`.
+
+### Notes
+
+- The Databricks job ID `databricks_ingest_cdc` triggers
+  (`utils.trigger_databricks_job(job_id=1088290843715942)`) is a hardcoded
+  integer literal in `orchestrate.py`, not read from `.env` or an Airflow
+  Variable/Connection. Known rough edge, not a design choice — moving it to
+  configuration is expected before this DAG is considered done.
+- The Databricks job itself — the bronze ingestion / CDC job this DAG
+  triggers — was created directly in the Databricks workspace and is not
+  defined by anything in this repository.
+
 ## [1.3.2] - 2026-08-26
 
 Builds the gold layer on top of the OBT: five ephemeral shaping models feeding
@@ -438,6 +528,8 @@ The dataset was generated on par to a UK/Tesco context:
   `product_id`, `order_id`, `order_item_id`) are surrogate integers starting at
   1 and are stable — downstream scripts can rely on them.
 
+[1.4.0]: https://github.com/aashishparuvada/tesco/
+[1.3.2]: https://github.com/aashishparuvada/tesco/
 [1.3.1]: https://github.com/aashishparuvada/tesco/
 [1.3.0]: https://github.com/aashishparuvada/tesco/
 [1.2.0]: https://github.com/aashishparuvada/tesco/

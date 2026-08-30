@@ -98,6 +98,35 @@ replication connection (logical replication does not pass through Supavisor, and
 the direct host needs the Pro-plan IPv4 add-on). Path B (federated read +
 `AUTO CDC`) is the free route and the recommended one to build first.
 
+## Orchestration (Airflow)
+
+`airflow/` is a second, independent `docker compose` project (its own
+`docker-compose.yaml`, `.env`, Postgres metadata DB) that runs the
+`dbt_tesco_pipeline` DAG (`airflow/dags/orchestrate.py`):
+`databricks_ingest_cdc` (triggers the existing Databricks bronze job) →
+`source_freshness` → silver models/tests → the OBT/tests → the gold layer.
+`LocalExecutor` via `command: standalone`, not the official `CeleryExecutor`
+compose — deliberate, since there is exactly one DAG here.
+
+- **`airflow/dags/utils.py` calls `databricks-sdk`'s `WorkspaceClient`
+  directly** (`run_now` + poll `get_run` to a terminal state) rather than the
+  `apache-airflow-providers-databricks` operator package. Keep it that way
+  unless there's a real reason to add the provider dependency.
+- **The triggered job ID is a hardcoded literal**
+  (`utils.trigger_databricks_job(job_id=...)` in `orchestrate.py`) — a known
+  rough edge, not settled design. Prefer moving it to `.env` or an Airflow
+  Variable over leaving it as a literal if you touch this function.
+- **`airflow/.env` changes need the container recreated, not just
+  `up -d`.** `env_file:` values are read at container creation; editing
+  `airflow/.env` and running `docker compose up -d` again does not reliably
+  refresh an already-running container. Use `cd airflow && docker compose
+  down && docker compose up -d --build` (`--build` too, whenever
+  `airflow/Dockerfile` also changed — otherwise the container comes back from
+  the stale image).
+- `DATABRICKS_HOST` / `DATABRICKS_TOKEN` belong only in the git-ignored
+  `airflow/.env`, never in `airflow/.env.example` — that template documents
+  every other variable but deliberately omits these two.
+
 ## Data
 
 Everything in `data/` is synthetic and safe to publish: Ofcom reserved drama

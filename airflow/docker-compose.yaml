@@ -1,0 +1,87 @@
+# Airflow's own stack -- a second, independent `docker compose up -d` from
+# the one at the repo root. The Postgres here is Airflow's metadata database
+# (task state, DAG runs); it has nothing to do with the project's raw_data
+# Postgres from Stage 0, so the two are kept as separate compose projects
+# rather than merged into one file.
+#
+# LocalExecutor + `airflow standalone` on purpose: one Airflow container
+# (api-server + scheduler + triggerer in a single process -- `api-server` is
+# Airflow 3.x's rename of what used to be the webserver) instead of the
+# official multi-service CeleryExecutor stack (redis, worker, flower) --
+# there is exactly one DAG here, so that stack would be pure overhead.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: ${AIRFLOW_METADATA_CONTAINER_NAME}
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      # A named volume, not a host bind path like the root compose file's
+      # POSTGRES_DATA_PATH -- Airflow's task-run history is disposable in
+      # this project; losing it on `docker compose down -v` is fine.
+      - airflow_metadata:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  airflow:
+    build: .
+    container_name: ${AIRFLOW_CONTAINER_NAME}
+    restart: unless-stopped
+    user: "${AIRFLOW_UID}:0"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    env_file:
+      - .env
+
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      # Not set: AIRFLOW__CORE__FERNET_KEY. Nothing in this project stores
+      # secrets as Airflow Connections/Variables yet -- dbt reads credentials
+      # straight from the mounted profiles.yml below. If that changes, pin a
+      # fixed Fernet key here, or it rotates (and breaks decryption) on every
+      # container rebuild.
+
+    ports:
+      - "${AIRFLOW_PORT}:8080"
+
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./plugins:/opt/airflow/plugins
+      - ./logs:/opt/airflow/logs
+      - ./config:/opt/airflow/config
+      # The dbt project itself, read-write. dbt writes target/, logs/, and
+      # dbt_packages/ back into this same mount, so `dbt/target/manifest.json`
+      # from an Airflow-triggered run is inspectable from the host exactly
+      # like a local `dbt run` -- see "The lineage graph is generated, not
+      # committed".
+      - ../dbt:/opt/dbt
+
+    command: standalone
+    # `airflow standalone` creates an admin user on first boot (via
+    # SimpleAuthManager, Airflow 3.x's default for standalone/dev use).
+    # Username is always `admin` -- not `airflow`, there is no such default
+    # user in Airflow 3.x. The generated password prints once, to this
+    # container's logs on first boot:
+    #   docker compose logs airflow | grep -A1 "Password for user"
+    # If you miss it, it is still readable afterwards (AIRFLOW_HOME is not one
+    # of the mounts above, so this lives only inside the container, not on
+    # the host):
+    #   docker compose exec airflow cat /opt/airflow/simple_auth_manager_passwords.json.generated
+
+volumes:
+  airflow_metadata:

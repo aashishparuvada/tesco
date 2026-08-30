@@ -1,0 +1,9 @@
+# Airflow writes here at runtime; not the dbt/logs/ or root logs -- this is
+# Airflow's own scheduler/task/webserver logs.
+logs/
+
+# Written inside the container's AIRFLOW_HOME by SimpleAuthManager, but if
+# you ever bind-mount the whole home directory instead of just
+# dags/plugins/logs/config, this stops the generated admin password from
+# landing in git.
+simple_auth_manager_passwords.json.generated

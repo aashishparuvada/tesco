@@ -30,6 +30,7 @@ README says so plainly instead of letting you discover it halfway through.
 - [Setting up dbt for Databricks](#setting-up-dbt-for-databricks)
 - [The silver layer in dbt](#the-silver-layer-in-dbt)
 - [The gold layer in dbt](#the-gold-layer-in-dbt)
+- [Orchestrating with Airflow](#orchestrating-with-airflow)
 - [Repository layout](#repository-layout)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
@@ -54,6 +55,8 @@ README says so plainly instead of letting you discover it halfway through.
 | Ephemeral models | Gold dimension shaping queries that never materialize, only inline |
 | Slowly changing dimensions | `dbt snapshot` (Type 2) turns an ephemeral query into a versioned table |
 | Path-based model config | `dbt_project.yml` sets materialization per directory, not per file |
+| Executor architecture | `LocalExecutor` (single process) vs. `CeleryExecutor` (Redis + worker fleet) |
+| Triggering an existing Databricks job from Airflow | `databricks-sdk`'s `WorkspaceClient.jobs.run_now`, polled with `get_run` until a terminal `life_cycle_state` |
 | The gap between docs and reality | Network, tier, and quota limits that block the happy path |
 
 That last row is not filler. Most of the difficulty in this project is not
@@ -1311,6 +1314,185 @@ drops below the directory level).
 
 ---
 
+## Orchestrating with Airflow
+
+`airflow/` runs `dbt_tesco_pipeline`, a single DAG (`airflow/dags/orchestrate.py`)
+that chains the whole pipeline end to end: trigger the Databricks job that
+lands bronze, check source freshness, then run the silver models, the OBT, and
+the gold layer above, with a test step after every model stage —
+
+```text
+databricks_ingest_cdc >> source_freshness >> silver >> silver_test
+                       >> obt >> obt_test >> gold_ephemeral >> gold_dimensions >> gold_fact
+```
+
+It runs on a small, hand-written `docker-compose.yaml` — not the official one
+Airflow publishes — and that is deliberate enough to be worth explaining before
+you go looking for the other six containers a tutorial told you to expect.
+
+### 1. LocalExecutor, not the official CeleryExecutor stack
+
+Apache's own [docker-compose.yaml](https://airflow.apache.org/docs/apache-airflow/3.3.1/docker-compose.yaml)
+defaults to `CeleryExecutor` and stands up eight services:
+
+| Service | Role |
+| --- | --- |
+| `postgres` | Metadata DB (task state, DAG runs) |
+| `redis` | Message broker — the queue Celery hands tasks through |
+| `airflow-init` | One-shot: DB migration + creates the admin user, then exits |
+| `airflow-scheduler` | Decides what runs, when |
+| `airflow-dag-processor` | Parses DAG files, separately from the scheduler (mandatory in Airflow 3.x — the scheduler never runs a DAG author's code directly) |
+| `airflow-api-server` | Serves the UI and REST API (renamed from `airflow-webserver` in 3.x) |
+| `airflow-triggerer` | Runs deferred/async tasks |
+| `airflow-worker` | Executes tasks pulled off the Redis queue — this is what you add replicas of to scale out |
+
+This repo's `airflow/docker-compose.yaml` runs the same logical components —
+scheduler, DAG processor, API server, triggerer — but as sub-processes of a
+**single** container, via `command: standalone` with
+`AIRFLOW__CORE__EXECUTOR: LocalExecutor`. `redis`, `airflow-init`, and
+`airflow-worker` disappear entirely: `LocalExecutor` runs tasks as local forked
+subprocesses of the scheduler itself, so there is no queue to broker and no
+separate worker fleet to dispatch to; `standalone` runs the DB migration and
+admin-user creation inline on boot instead of in a container that exits.
+
+`docker ps` showing two containers instead of eight is really "no distribution
+layer," not "fewer components." The right call here, not a shortcut: this repo
+has exactly one DAG, so `CeleryExecutor`'s horizontal-scaling machinery is
+overhead with nothing to scale. The official compose earns its complexity the
+moment you have enough concurrent, heavy DAGs that one machine's CPU stops
+being enough — `LocalExecutor` is capped by whatever `parallelism` your single
+host can sustain.
+
+> [!NOTE]
+> This is also why the admin login differs from what the official compose
+> teaches. The official `airflow-init` creates a **fixed** `airflow` / `airflow`
+> login via `_AIRFLOW_WWW_USER_USERNAME` / `_AIRFLOW_WWW_USER_PASSWORD`. Our
+> `standalone` command uses `SimpleAuthManager`, which creates a user named
+> `admin` with a **random** password, printed once to the container's logs on
+> first boot (`docker compose logs airflow | grep -A1 "Password for user"`) —
+> see the comment above `command: standalone` in `airflow/docker-compose.yaml`.
+
+### 2. Triggering the Databricks job with the SDK, not a Databricks provider
+
+`databricks_ingest_cdc`, the DAG's first task, does not run bronze ingestion
+itself — the job that lands bronze already exists in the Databricks workspace,
+created and owned outside this repo. The task's only responsibility is to
+start that job and block the rest of the DAG until it finishes, so
+`source_freshness` and the silver models never run against a bronze table
+that is still mid-write.
+
+`airflow/dags/utils.py` does this with the `databricks-sdk` package directly
+— `WorkspaceClient` — rather than the `apache-airflow-providers-databricks`
+provider package most Airflow+Databricks tutorials reach for. There is no
+`DatabricksRunNowOperator` here:
+
+- `establish_databricks_connection()` reads `DATABRICKS_HOST` /
+  `DATABRICKS_TOKEN` from the environment and raises `ValueError` immediately
+  if either is missing, rather than letting the SDK fail later with a less
+  specific error.
+- `trigger_databricks_job(job_id)` calls `w.jobs.run_now(job_id=...)`, then
+  polls `w.jobs.get_run()` every 5 seconds until `life_cycle_state` reaches a
+  terminal state (`TERMINATED`, `SKIPPED`, or `INTERNAL_ERROR`). A
+  non-`SUCCESS` `result_state` at that point raises, which fails the Airflow
+  task — the DAG never reaches `source_freshness` on a failed or skipped run.
+- The job ID is passed as a plain integer literal
+  (`utils.trigger_databricks_job(job_id=1088290843715942)` in `orchestrate.py`),
+  not read from `.env` or an Airflow Variable/Connection. That is a known
+  rough edge, not a design choice — moving it to configuration is on the list
+  before this DAG is treated as done.
+- `load_dotenv()` in `utils.py` reads `airflow/.env` a second time, independently
+  of Compose's own `env_file:` line in `docker-compose.yaml` below. Redundant
+  when the DAG runs inside the container Compose starts, but it means
+  `DATABRICKS_HOST`/`DATABRICKS_TOKEN` also resolve correctly if `utils.py` is
+  imported directly (e.g. `uv run python -c "import utils"` from `airflow/dags/`
+  for a quick credentials sanity check) — a path Compose's env injection never
+  covers.
+
+`airflow/.env.example` deliberately does *not* list `DATABRICKS_HOST` /
+`DATABRICKS_TOKEN` — copy `.env.example` to `.env` as usual, then add both
+yourself; they are not part of the template because a workspace host and
+token are exactly the kind of value that should never end up example-shaped
+in git history, even as placeholders.
+
+### 3. `.env` changes need `down` + rebuild, not just `up -d`
+
+Adding `DATABRICKS_HOST` and `DATABRICKS_TOKEN` to `airflow/.env` *after* the
+`airflow` container already existed, then re-running `docker compose up -d`,
+did not make them visible inside the running container — `os.getenv` kept
+returning `None`, and `establish_databricks_connection()` raised its
+`ValueError` as if the file were still empty.
+
+The values in `env_file: - .env` get baked into a container at **creation**,
+not re-read on every `up`. In practice, editing the referenced `.env` file's
+*contents* is not always enough on its own to make Compose decide the
+container needs recreating the way editing `docker-compose.yaml` itself is —
+so `up -d` can leave an already-running container exactly as it was. The fix
+that actually took effect was recreating the container outright, from
+`airflow/`:
+
+```bash
+cd airflow
+docker compose down
+docker compose up -d --build
+```
+
+`--build` matters here for a second, unrelated reason: `airflow/Dockerfile`
+picked up a new `RUN pip install ... databricks-sdk` line in the same round of
+changes. `docker compose down && docker compose up -d` alone would recreate
+the container from the *old* image and fail the task with
+`ModuleNotFoundError: No module named 'databricks'` instead of the credentials
+error. `down` (without `-v`) removes only the `airflow` and `postgres`
+containers — the named `airflow_metadata` volume, and with it the DAG run
+history and the generated `admin` password, survives.
+
+### 4. Using the official docker-compose.yaml instead
+
+If you want the distributed shape — to match a tutorial, or because you
+outgrow one DAG — fetch it directly rather than hand-copying it (it is long
+and changes across versions):
+
+```bash
+curl -LfO 'https://airflow.apache.org/docs/apache-airflow/3.3.1/docker-compose.yaml'
+```
+
+(Swap `3.3.1` for whatever `airflow/Dockerfile`'s `FROM apache/airflow:...`
+line pins, so the compose file and the image agree. `.../stable/docker-compose.yaml`
+tracks whatever is newest, which may not match this repo's pin.)
+
+What has to change to make it work with this project, since the official file
+pulls the stock `apache/airflow` image rather than building `airflow/Dockerfile`:
+
+- **Point it at a custom image, or extend it.** The official compose's
+  `x-airflow-common.image` needs to build from `airflow/Dockerfile` (or you add
+  the same `RUN pip install "dbt-core<1.12" "dbt-databricks>=1.12.4"
+  "databricks-sdk>=0.117.0"` step to its image config) — without it, none of
+  `airflow-scheduler`, `airflow-dag-processor`, or any `airflow-worker` has
+  `dbt` or the `databricks` package on its `PATH`.
+- **Mount `../dbt:/opt/dbt` on every service that touches it.** Not just one
+  container this time — `airflow-dag-processor` needs it to parse the DAG,
+  and **every** `airflow-worker` replica needs it too, since `CeleryExecutor`
+  cannot guarantee which worker picks up a given task run. Miss one and that
+  worker's task fails with `dbt: command not found` or a missing project
+  directory, depending on which half of the mount you forgot.
+- **`airflow/dags/orchestrate.py` and `utils.py` do not need to change.**
+  Neither `BashOperator` nor the `databricks-sdk` calls in `utils.py` know or
+  care whether `LocalExecutor` or `CeleryExecutor` is what runs them — drop
+  both files into the official compose's `./dags` unchanged. `DATABRICKS_HOST`
+  / `DATABRICKS_TOKEN` still need to reach every worker, though — via
+  `env_file` on `x-airflow-common`, same as here.
+- **`AIRFLOW_UID` in `.env` is mandatory on Linux**, not just recommended —
+  the official docs have you generate it with
+  `echo -e "AIRFLOW_UID=$(id -u)" > .env` before first boot, or the mounted
+  `dags`/`logs`/`plugins`/`config` directories end up root-owned.
+- **Login is `airflow` / `airflow`** by default (see the note above) — no log
+  message to go find, unless you override
+  `_AIRFLOW_WWW_USER_USERNAME`/`_AIRFLOW_WWW_USER_PASSWORD` in `.env`.
+- **The `.env` gotcha above still applies**, official compose or not — a
+  container Compose already created does not pick up a newly-edited `.env` on
+  a plain `up -d`. See [.env changes need down + rebuild, not just up -d](#3-env-changes-need-down--rebuild-not-just-up--d).
+
+---
+
 ## Repository layout
 
 ```
@@ -1339,6 +1521,13 @@ tesco/
 │   ├── dbt_project.yml
 │   ├── profiles.yml.example       # Copy to profiles.yml - GIT-IGNORED
 │   └── profiles.yml               # Your host / http_path / token - never committed
+├── airflow/
+│   ├── dags/
+│   │   ├── orchestrate.py         # DAG: databricks job -> silver -> obt -> gold -> tests
+│   │   └── utils.py               # databricks-sdk: trigger + poll an existing job
+│   ├── Dockerfile                 # apache/airflow + dbt-core/dbt-databricks/databricks-sdk
+│   ├── docker-compose.yaml        # LocalExecutor, `airflow standalone` - hand-written, not official
+│   └── .env.example
 ├── .vscode/                       # Interpreter + extension recommendations
 ├── docker-compose.yaml            # Local Postgres 16
 ├── .env.example                   # Every variable, documented
@@ -1396,6 +1585,10 @@ spaces and no column alignment padding.
 | Rows duplicate on every run | The model lost `incremental_strategy = 'merge'` or its `unique_key`; the default strategy appends. |
 | `test_obt` warns about `NULL` keys | Working as intended. The OBT uses `LEFT JOIN`, so a `NULL` key is a real referential gap in the source, surfaced at `warn` rather than failing the build. |
 | `sqlfluff` fails on dbt models in pre-commit | Layout rules, not SQL errors. `sqlfluff-fix` runs in the same hook and rewrites them; re-stage and commit again. |
+| `401 Unauthorized` logging into the Airflow UI with `airflow` / `airflow` | That is the official `docker-compose.yaml`'s fixed login, not this repo's. Use `admin` plus the random password printed to `docker compose logs airflow` on first boot — see [LocalExecutor, not the official CeleryExecutor stack](#1-localexecutor-not-the-official-celeryexecutor-stack). |
+| Airflow task fails with `dbt: command not found` (official `docker-compose.yaml`) | The stock `apache/airflow` image has no `dbt` installed. Point `x-airflow-common.image` at `airflow/Dockerfile`, or add its `pip install` step to your image config — see [using the official docker-compose.yaml instead](#4-using-the-official-docker-composeyaml-instead). |
+| `databricks_ingest_cdc` fails with `DATABRICKS_HOST environment variable is not set`, even after adding it to `airflow/.env` | Compose bakes `env_file:` values into a container at creation, not on every `up`. Editing `.env` and running `docker compose up -d` again does not refresh an already-running container — recreate it: `cd airflow && docker compose down && docker compose up -d --build` — see [.env changes need down + rebuild, not just up -d](#3-env-changes-need-down--rebuild-not-just-up--d). |
+| `ModuleNotFoundError: No module named 'databricks'` in an Airflow task log | The container was recreated from an image built before `airflow/Dockerfile`'s `databricks-sdk` install was added. Rerun with `docker compose up -d --build`, not a bare `up -d`. |
 | `dim_customers` (or any `dim_*`) is empty after `dbt run` | `dbt run` does not build snapshots. Run `uv run dbt snapshot`, or `uv run dbt build` — see [the gold layer](#4-materialization-is-centralized-in-dbt_projectyml). |
 | Selecting an ephemeral model directly (`dbt run --select eph_customers`) does nothing | Expected. Ephemeral models have no relation to build; they only compile as a CTE inside whatever `ref()`s them — see [ephemeral models](#1-ephemeral-models-shape-each-dimension-they-never-materialize). |
 
@@ -1409,7 +1602,7 @@ spaces and no column alignment padding.
 - [ ] **CDC into a Databricks catalog** ← current stage
 - [ ] **Bronze → silver transformations in dbt, with data quality expectations** — models, the OBT, and the tests are written; they run once Stage 2 lands bronze
 - [ ] **Gold-layer dimensional model (star schema over orders)** — five SCD Type 2 dimensions (ephemeral models + snapshots) and the order-item fact table are written; they run once Stage 2 lands bronze and silver builds
-- [ ] Orchestration and scheduling
+- [ ] **Orchestration and scheduling** — `airflow/`'s `dbt_tesco_pipeline` DAG is written (`LocalExecutor` via `airflow standalone`), and its first task now triggers the existing Databricks bronze job via `databricks-sdk` before the dbt chain; the DAG runs end to end once that job and the gold layer above are both verified
 - [ ] Tests and data quality gates in CI
 
 ---
